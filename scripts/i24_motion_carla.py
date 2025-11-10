@@ -5,15 +5,17 @@ import carla
 import time
 
 class I24MotionCarlaSimulation:
-    episode_length = 100.0
+    episode_length = 600.0
     mile_to_feet = 5280.0
     feet_to_meters = 0.3048
-    waypoint_distance = 1.0 # Meters
+    waypoint_distance = 2.0 # Meters
     tick_step = 0.05
-    lead_distance = 0.0
-    vehicle_speed = 128.748 # kph
+    lead_distance = 1.0
+    #vehicle_speed = 128.748 # kph
+    vehicle_speed = 200.0 # 100 mph
+    default_speed_limit = 30.0 # kph
 
-    def __init__(self, host, port, density_data_path, mapping_path, trajectory_output_path):
+    def __init__(self, host, port, density_data_path, mapping_path, trajectory_output_path, cell_metadata_output_path):
         self.host = host
         self.port = port
         self.tm_port = 8000
@@ -21,6 +23,7 @@ class I24MotionCarlaSimulation:
         self.world = None
         self.carla_map = None
         self.current_time = 0.0
+        self.current_density_time = None
         self.road_cells = {}
         self.cars = []
         self.tm = None
@@ -32,6 +35,7 @@ class I24MotionCarlaSimulation:
         self.time_origin = self.density_data["time_start"]
         self.density_time_step = self.density_data["time_interval"]
         self.trajectory_output_path = trajectory_output_path
+        self.cell_metadata_output_path = cell_metadata_output_path
         self.trajectory_data = pandas.DataFrame(
             {
                 "simulation_time": pandas.Series(dtype="float"),
@@ -40,9 +44,15 @@ class I24MotionCarlaSimulation:
                 "lane_id": pandas.Series(dtype="int"),
                 "s": pandas.Series(dtype="float"),
                 "velocity": pandas.Series(dtype="float"),
-                "speed_limit_current": pandas.Series(dtype="float")
+                "speed_limit": pandas.Series(dtype="float")
             }
         )
+
+    def discreteSampler(self, n):
+        return n
+    
+    def discreteSamplerRandom(self, n):
+        return numpy.random.poisson(lam=n)
 
     def connectToHost(self):
         self.client = carla.Client(self.host, self.port)
@@ -54,8 +64,8 @@ class I24MotionCarlaSimulation:
         settings.fixed_delta_seconds = self.tick_step
         settings.no_rendering_mode = True
         self.tm = self.client.get_trafficmanager(self.tm_port)
-        #self.tm.set_global_distance_to_leading_vehicle(self.lead_distance)
-        #self.tm.global_percentage_speed_difference(-400.0)
+        self.tm.set_global_distance_to_leading_vehicle(self.lead_distance)
+        self.tm.global_percentage_speed_difference(0.0)
         self.tm.set_synchronous_mode(True)
         self.world.apply_settings(settings)
         self.world.tick()
@@ -67,7 +77,7 @@ class I24MotionCarlaSimulation:
             self.seedSimulation()
             while (self.current_time < self.episode_length):
                 self.tick()
-                print(self.current_time)
+                #print(self.current_time)
         finally:
             settings = self.world.get_settings()
             settings.synchronous_mode = False
@@ -81,55 +91,122 @@ class I24MotionCarlaSimulation:
             print(f"Saving {len(self.trajectory_data)} records to CSV at {self.trajectory_output_path}!")
             self.trajectory_data.to_csv(self.trajectory_output_path, index=False, header=True)
 
+            print(f"Saving road cell records to CSV at {self.cell_metadata_output_path}!")
+            for road in self.road_cells:
+                for lane in self.road_cells[road]["inflow_ghost_cell"]:
+                    self.road_cells[road]["inflow_ghost_cell"][lane]["waypoints"] = None
+                for lane in self.road_cells[road]["outflow_ghost_cell"]:
+                    self.road_cells[road]["outflow_ghost_cell"][lane]["waypoints"] = None
+                for m in self.road_cells[road]["normal_cells"]:
+                    for lane in self.road_cells[road]["normal_cells"][m]:
+                        self.road_cells[road]["normal_cells"][m][lane]["waypoints"] = None
+            with open(self.cell_metadata_output_path, "w+") as f:
+                json.dump(self.road_cells, f, indent=4)
+
     def tick(self):
-        current_time = time.time()
         self.world.tick()
         self.current_time += self.tick_step
         self.fetchData()
+        self.updateDensityDataFromReal()
         self.updateVehicles()
 
+    def updateDensityDataFromReal(self):
+        if self.calculateCurrentDensityTime() > self.current_density_time:
+            # Update inflows and outflows!
+            self.current_density_time = self.calculateCurrentDensityTime()
+            # Ingoing ghost cells
+            for road in self.road_cells:
+                for lane_id in self.road_cells[road]["inflow_ghost_cell"]:
+                    cell_metadata = self.road_cells[road]["inflow_ghost_cell"][lane_id]
+                    cell_i24_data = self.getCurrentDensityInformation(cell_metadata["density_marker"], cell_metadata["density_road_id"], lane_id)
+                    cell_metadata["cumulative_inflow_real"] += self.discreteSampler(cell_i24_data["inflow"])#cell_i24_data["inflow"]#
+                    cell_metadata["cumulative_outflow_real"] += self.discreteSampler(cell_i24_data["outflow"])#cell_i24_data["outflow"]#
+
+            # Outgoing ghost cells
+            for road in self.road_cells:
+                for lane_id in self.road_cells[road]["outflow_ghost_cell"]:
+                    cell_metadata = self.road_cells[road]["outflow_ghost_cell"][lane_id]
+                    cell_i24_data = self.getCurrentDensityInformation(cell_metadata["density_marker"], cell_metadata["density_road_id"], lane_id)
+                    cell_metadata["cumulative_inflow_real"] += self.discreteSampler(cell_i24_data["inflow"])#cell_i24_data["inflow"]#
+                    cell_metadata["cumulative_outflow_real"] += self.discreteSampler(cell_i24_data["outflow"])#cell_i24_data["outflow"]#
+
+
     def updateVehicles(self):
-        # If any vehicles are in the outgoing ghost zone, delete them for now
+        # Outgoing ghost cells
         vehicle_actors = self.world.get_actors(self.cars)
+        cars_and_lanes = {}
+        for road in self.road_cells:
+            cars_and_lanes[road] = {}
+            for lane_id in self.road_cells[road]["outflow_ghost_cell"]:
+                cars_and_lanes[road][lane_id] = []
+                cell_metadata = self.road_cells[road]["outflow_ghost_cell"][lane_id]
+                for vehicle in vehicle_actors:
+                    actor_id = vehicle.id
+                    location = vehicle.get_location()
+                    closest_waypoint = self.carla_map.get_waypoint(location, project_to_road=True)
+                    vehicle_road_id = closest_waypoint.road_id
+                    vehicle_lane_id = closest_waypoint.lane_id
+                    if (vehicle_road_id == road) and (vehicle_lane_id == lane_id):
+                        cars_and_lanes[road][lane_id].append((vehicle, closest_waypoint.s))
+
         batch = []
-        for vehicle in vehicle_actors:
-            actor_id = vehicle.id
-            location = vehicle.get_location()
-            closest_waypoint = self.carla_map.get_waypoint(location, project_to_road=True)
-            road_id = closest_waypoint.road_id
-            lane_id = closest_waypoint.lane_id
-            cell_metadata = self.road_cells[road_id]
-            outflow_ghost_cell = cell_metadata["outflow_ghost_cell"][lane_id]
-            s = closest_waypoint.s
-            if (s >= outflow_ghost_cell["s_start"]):
-                print(f"Removing {actor_id} at {s} in {road_id}:{lane_id}")
-                batch.append(carla.command.DestroyActor(actor_id))
-                self.cars.pop(self.cars.index(actor_id))
+        halted_vehicles_id = []
+        for road in cars_and_lanes:
+            for lane_id in cars_and_lanes[road]:
+                sorted_by_s_vehicles = sorted(cars_and_lanes[road][lane_id], key= lambda vehicle: vehicle[1], reverse=True)
+                cell_metadata = self.road_cells[road]
+                outflow_ghost_cell = cell_metadata["outflow_ghost_cell"][lane_id]
+                for (vehicle, s) in sorted_by_s_vehicles:
+                    actor_id = vehicle.id
+                    if (s >= outflow_ghost_cell["s_start"]):
+                        if (outflow_ghost_cell["cumulative_outflow_real"] > outflow_ghost_cell["cumulative_outflow_sim"]):
+                            print(f"Removing {actor_id} at {s} in {road}:{lane_id}")
+                            batch.append(carla.command.DestroyActor(actor_id))
+                            self.cars.pop(self.cars.index(actor_id))
+                            outflow_ghost_cell["cumulative_outflow_sim"] += 1
+                        elif (s >= outflow_ghost_cell["s_end"]):
+                            #print(f"Halting {actor_id} at {s} in {road_id}:{lane_id}")
+                            self.tm.set_desired_speed(vehicle, 0.0)
+                            halted_vehicles_id.append(vehicle.id)
+
         self.client.apply_batch_sync(batch, False)
 
-        # For all remaining vehicles, make sure their TM is appropriately set.
+        # Ingoing ghost cells
+        for road in self.road_cells:
+            for lane_id in self.road_cells[road]["inflow_ghost_cell"]:
+                cell_metadata = self.road_cells[road]["inflow_ghost_cell"][lane_id]
+                if (cell_metadata["cumulative_inflow_real"] > cell_metadata["cumulative_inflow_sim"]):
+                    delta = cell_metadata["cumulative_inflow_real"] - cell_metadata["cumulative_inflow_sim"]
+                    cell_metadata["cumulative_inflow_sim"] += self.generateVehiclesInCell(cell_metadata, delta)
+                    print(f"Spawned {delta} vehicles in {road}:{lane_id}!")
+        
         vehicle_actors = self.world.get_actors(self.cars)
         for vehicle in vehicle_actors:
-            self.tm.distance_to_leading_vehicle(vehicle, self.lead_distance)
-            self.tm.vehicle_percentage_speed_difference(vehicle, 0.0)
-            self.tm.ignore_lights_percentage(vehicle,100)
-            self.tm.ignore_signs_percentage(vehicle,100)
-            self.tm.set_desired_speed(vehicle, self.vehicle_speed)
+            if vehicle.id not in halted_vehicles_id:
+                vehicle.set_autopilot(True, self.tm_port)
+                self.tm.distance_to_leading_vehicle(vehicle, self.lead_distance)
+                self.tm.random_left_lanechange_percentage(vehicle, 50)
+                self.tm.random_right_lanechange_percentage(vehicle, 50)
+                self.tm.set_desired_speed(vehicle, self.vehicle_speed)
 
     def fetchData(self):
-        print(len(self.cars))
         vehicle_actors = self.world.get_actors(self.cars)
         vehicle_ids = []
         road_ids = []
         lane_ids = []
         s_positions = []
         velocities = []
+        velocities_eastbound = []
+        velocities_westbound = []
         simulation_time = []
         speed_limit_current = []
         for vehicle in vehicle_actors:
             velocity = vehicle.get_velocity().length()
             location = vehicle.get_location()
             closest_waypoint = self.carla_map.get_waypoint(location, project_to_road=True)
+            if (location.distance(closest_waypoint.transform.location) > 10.0):
+                print("skipping!")
+                continue
             vehicle_id = vehicle.id
             road_id = closest_waypoint.road_id
             lane_id = closest_waypoint.lane_id
@@ -142,8 +219,12 @@ class I24MotionCarlaSimulation:
             velocities.append(velocity)
             simulation_time.append(self.current_time)
             speed_limit_current.append(speed_limit)
-        print(numpy.min(velocities), numpy.mean(velocities), numpy.max(velocities), numpy.std(velocities))
-        print(numpy.min(speed_limit_current), numpy.mean(speed_limit_current), numpy.max(speed_limit_current), numpy.std(speed_limit_current))
+            if (road_id == 1) and (s >= self.road_cells[road_id]["inflow_ghost_cell"][lane_id]["s_end"]) and (s <= self.road_cells[road_id]["outflow_ghost_cell"][lane_id]["s_start"]):
+                velocities_eastbound.append(velocity)
+            elif (road_id == 2) and (s >= self.road_cells[road_id]["inflow_ghost_cell"][lane_id]["s_end"]) and (s <= self.road_cells[road_id]["outflow_ghost_cell"][lane_id]["s_start"]):
+                velocities_westbound.append(velocity)
+        print("Velocities ", numpy.mean(velocities), numpy.mean(velocities_eastbound), numpy.mean(velocities_westbound), self.current_time)
+        #print("SPEED LIMIT ", numpy.min(speed_limit_current), numpy.mean(speed_limit_current), numpy.max(speed_limit_current), numpy.std(speed_limit_current))
         concat_df = pandas.DataFrame({
             "simulation_time": simulation_time,
             "vehicle_id": vehicle_ids,
@@ -153,7 +234,7 @@ class I24MotionCarlaSimulation:
             "velocity": velocities,
             "speed_limit": speed_limit_current
         })
-        print(f"Recording {len(concat_df)} records!")
+        #print(f"Recording {len(concat_df)} records!")
         self.trajectory_data = pandas.concat([self.trajectory_data, concat_df])
 
     def calculateDensityTime(self, sim_time):
@@ -203,8 +284,12 @@ class I24MotionCarlaSimulation:
                 s_end = I24MotionCarlaSimulation.westboundMarkerToS(front_marker, road_entry_mapping["origin_marker"], road_entry_mapping["origin_meter"])
             lane_data["s_start"] = s_start
             lane_data["s_end"] = s_end
-            lane_data["waypoints"] = [waypoint for waypoint in waypoints if (waypoint.road_id == road_id) and (waypoint.lane_id == lane_id) and (waypoint.s >= s_start) and (waypoint.s <= s_end)]
+            lane_data["waypoints"] = [waypoint for waypoint in waypoints if (waypoint.road_id == road_id) and (waypoint.lane_id == lane_id) and (waypoint.s >= s_start) and (waypoint.s < s_end)]
             lane_data["density_road_id"] = road_entry_mapping["direction"]
+            lane_data["cumulative_inflow_real"] = 0
+            lane_data["cumulative_outflow_real"] = 0
+            lane_data["cumulative_inflow_sim"] = 0
+            lane_data["cumulative_outflow_sim"] = 0
 
             result[lane_id] = lane_data       
         return result
@@ -227,13 +312,11 @@ class I24MotionCarlaSimulation:
         self.road_cells = metadata
 
     def generateVehiclesInCell(self, cell_info, number_of_vehicles, fail_count=0):
-        fail_attempts_limit = 3
+        fail_attempts_limit = 10
         if (fail_count >= fail_attempts_limit):
-            print(f"Failed to spawn {number_of_vehicles} in {cell_info}")
-            return
+            return 0
         vehicle_blueprints = [bp for bp in self.world.get_blueprint_library().filter('vehicle*') 
                               if ("nissan" in bp.id) or 
-                              ("carlamotors" in bp.id) or 
                               ("dodge" in bp.id) or 
                               ("toyota" in bp.id) or
                               ("audi" in bp.id) or 
@@ -249,14 +332,14 @@ class I24MotionCarlaSimulation:
         new_vehicles_list = []
         for i in range(number_of_vehicles):        
             selected_waypoint = numpy.random.choice(cell_info["waypoints"]).transform
-            selected_waypoint.location.z += 1.0
+            selected_waypoint.location.z += 0.25
             selected_blueprint = numpy.random.choice(vehicle_blueprints)
             batch.append(carla.command.SpawnActor(selected_blueprint, selected_waypoint)
                 .then(carla.command.SetAutopilot(carla.command.FutureActor, True, self.tm_port)))
         
         for response in self.client.apply_batch_sync(batch, False):
             if response.error:
-                print("Failed to spawn vehicle!")
+                pass
             else:
                 new_vehicles_list.append(response.actor_id)
         all_vehicle_actors = self.world.get_actors(new_vehicles_list)
@@ -266,40 +349,52 @@ class I24MotionCarlaSimulation:
         for actor in all_vehicle_actors:
             actor.set_autopilot(True, self.tm_port)
             self.tm.distance_to_leading_vehicle(actor, self.lead_distance)
-            self.tm.vehicle_percentage_speed_difference(actor, 0.0)
-            self.tm.ignore_lights_percentage(actor,100)
-            self.tm.ignore_signs_percentage(actor,100)
-            #self.tm.set_desired_speed(actor, 0.0)
+            self.tm.random_left_lanechange_percentage(actor, 50)
+            self.tm.random_right_lanechange_percentage(actor, 50)
+            #self.tm.vehicle_percentage_speed_difference(actor, 0.0)
+            #self.tm.vehicle_percentage_speed_difference(actor, ((self.vehicle_speed / self.default_speed_limit)) * -100.0)
+            #self.tm.ignore_lights_percentage(actor,100)
+            #self.tm.ignore_signs_percentage(actor,100)
+            #self.tm.distance_to_leading_vehicle(actor, 0.0)
+            #self.tm.ignore_vehicles_percentage(actor, 100.0) 
+            self.tm.set_desired_speed(actor, self.vehicle_speed)
 
         # If we failed to spawn vehicles, try again
         failed_number_of_spawns = number_of_vehicles - len(all_vehicle_actors)
         if (failed_number_of_spawns > 0):
-            self.generateVehiclesInCell(cell_info, failed_number_of_spawns, fail_count=fail_count+1)
-
+            return len(all_vehicle_actors) + self.generateVehiclesInCell(cell_info, failed_number_of_spawns, fail_count=fail_count+1)
+        return len(all_vehicle_actors)
     
     def seedSimulation(self):
+        self.current_density_time = self.calculateCurrentDensityTime()
         # Normal cells
         for road in self.road_cells:
             for m in self.road_cells[road]["normal_cells"]:
                 for lane_id in self.road_cells[road]["normal_cells"][m]:
                     cell_metadata = self.road_cells[road]["normal_cells"][m][lane_id]
                     cell_i24_data = self.getCurrentDensityInformation(cell_metadata["density_marker"], cell_metadata["density_road_id"], lane_id)
-                    self.generateVehiclesInCell(cell_metadata, cell_i24_data["vehicle_count"])
+                    self.generateVehiclesInCell(cell_metadata, self.discreteSampler(cell_i24_data["vehicle_count"]))
         
         # Ingoing ghost cells
         for road in self.road_cells:
             for lane_id in self.road_cells[road]["inflow_ghost_cell"]:
                 cell_metadata = self.road_cells[road]["inflow_ghost_cell"][lane_id]
                 cell_i24_data = self.getCurrentDensityInformation(cell_metadata["density_marker"], cell_metadata["density_road_id"], lane_id)
-                self.generateVehiclesInCell(cell_metadata, cell_i24_data["vehicle_count"])
+                cell_metadata["cumulative_inflow_real"] = cell_i24_data["inflow"]
+                cell_metadata["cumulative_outflow_real"] = cell_i24_data["outflow"]
+                cell_metadata["cumulative_inflow_sim"] = cell_i24_data["inflow"]
+                self.generateVehiclesInCell(cell_metadata, self.discreteSampler(cell_i24_data["vehicle_count"] - cell_i24_data["outflow"]))
 
         # Outgoing ghost cells
         for road in self.road_cells:
             for lane_id in self.road_cells[road]["outflow_ghost_cell"]:
-                cell_metadata = self.road_cells[road]["inflow_ghost_cell"][lane_id]
+                cell_metadata = self.road_cells[road]["outflow_ghost_cell"][lane_id]
                 cell_i24_data = self.getCurrentDensityInformation(cell_metadata["density_marker"], cell_metadata["density_road_id"], lane_id)
-                self.generateVehiclesInCell(cell_metadata, cell_i24_data["vehicle_count"])
+                cell_metadata["cumulative_inflow_real"] = cell_i24_data["inflow"]
+                cell_metadata["cumulative_outflow_real"] = cell_i24_data["outflow"]
+                cell_metadata["cumulative_outflow_sim"] = cell_i24_data["outflow"]
+                self.generateVehiclesInCell(cell_metadata, self.discreteSampler(cell_i24_data["vehicle_count"] - cell_i24_data["outflow"]))
 
 if __name__ == "__main__":
-    sim = I24MotionCarlaSimulation("localhost", 2000, "final_density_data.json", "i24_motion_to_carla_mapping_adjusted_origin.json", "result4.csv")
+    sim = I24MotionCarlaSimulation("localhost", 2000, "final_density_data_1s_delta.json", "i24_motion_to_carla_mapping_adjusted_origin.json", "result5.csv", "metadata_output.json")
     sim.launchSimulation()
