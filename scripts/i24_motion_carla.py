@@ -8,11 +8,11 @@ class I24MotionCarlaSimulation:
     episode_length = 600.0
     mile_to_feet = 5280.0
     feet_to_meters = 0.3048
-    waypoint_distance = 2.0 # Meters
+    waypoint_distance = 5.0 # Meters
     tick_step = 0.05
-    lead_distance = 1.0
+    lead_distance = 0.01
     #vehicle_speed = 128.748 # kph
-    vehicle_speed = 200.0 # 100 mph
+    vehicle_speed = 200.0
     default_speed_limit = 30.0 # kph
 
     def __init__(self, host, port, density_data_path, mapping_path, trajectory_output_path, cell_metadata_output_path):
@@ -49,7 +49,7 @@ class I24MotionCarlaSimulation:
         )
 
     def discreteSampler(self, n):
-        return n
+        return numpy.random.poisson(lam=n)
     
     def discreteSamplerRandom(self, n):
         return numpy.random.poisson(lam=n)
@@ -64,6 +64,7 @@ class I24MotionCarlaSimulation:
         settings.fixed_delta_seconds = self.tick_step
         settings.no_rendering_mode = True
         self.tm = self.client.get_trafficmanager(self.tm_port)
+        self.tm.set_random_device_seed(42)
         self.tm.set_global_distance_to_leading_vehicle(self.lead_distance)
         self.tm.global_percentage_speed_difference(0.0)
         self.tm.set_synchronous_mode(True)
@@ -185,9 +186,10 @@ class I24MotionCarlaSimulation:
             if vehicle.id not in halted_vehicles_id:
                 vehicle.set_autopilot(True, self.tm_port)
                 self.tm.distance_to_leading_vehicle(vehicle, self.lead_distance)
-                self.tm.random_left_lanechange_percentage(vehicle, 50)
-                self.tm.random_right_lanechange_percentage(vehicle, 50)
-                self.tm.set_desired_speed(vehicle, self.vehicle_speed)
+                #self.tm.random_left_lanechange_percentage(vehicle, 0.1)
+                #self.tm.random_right_lanechange_percentage(vehicle, 0.1)
+                self.tm.vehicle_percentage_speed_difference(vehicle, ((self.vehicle_speed / self.default_speed_limit) + 1) * -100.0)
+                #self.tm.set_desired_speed(vehicle, self.vehicle_speed)
 
     def fetchData(self):
         vehicle_actors = self.world.get_actors(self.cars)
@@ -204,7 +206,7 @@ class I24MotionCarlaSimulation:
             velocity = vehicle.get_velocity().length()
             location = vehicle.get_location()
             closest_waypoint = self.carla_map.get_waypoint(location, project_to_road=True)
-            if (location.distance(closest_waypoint.transform.location) > 10.0):
+            if (location.distance(closest_waypoint.transform.location) > 0.5):
                 print("skipping!")
                 continue
             vehicle_id = vehicle.id
@@ -284,6 +286,7 @@ class I24MotionCarlaSimulation:
                 s_end = I24MotionCarlaSimulation.westboundMarkerToS(front_marker, road_entry_mapping["origin_marker"], road_entry_mapping["origin_meter"])
             lane_data["s_start"] = s_start
             lane_data["s_end"] = s_end
+            lane_data["length"] = s_end - s_start
             lane_data["waypoints"] = [waypoint for waypoint in waypoints if (waypoint.road_id == road_id) and (waypoint.lane_id == lane_id) and (waypoint.s >= s_start) and (waypoint.s < s_end)]
             lane_data["density_road_id"] = road_entry_mapping["direction"]
             lane_data["cumulative_inflow_real"] = 0
@@ -317,6 +320,7 @@ class I24MotionCarlaSimulation:
             return 0
         vehicle_blueprints = [bp for bp in self.world.get_blueprint_library().filter('vehicle*') 
                               if ("nissan" in bp.id) or 
+                              ("carlamotors" in bp.id) or
                               ("dodge" in bp.id) or 
                               ("toyota" in bp.id) or
                               ("audi" in bp.id) or 
@@ -349,15 +353,15 @@ class I24MotionCarlaSimulation:
         for actor in all_vehicle_actors:
             actor.set_autopilot(True, self.tm_port)
             self.tm.distance_to_leading_vehicle(actor, self.lead_distance)
-            self.tm.random_left_lanechange_percentage(actor, 50)
-            self.tm.random_right_lanechange_percentage(actor, 50)
+            #self.tm.random_left_lanechange_percentage(actor, 0.1)
+            #self.tm.random_right_lanechange_percentage(actor, 0.1)
             #self.tm.vehicle_percentage_speed_difference(actor, 0.0)
-            #self.tm.vehicle_percentage_speed_difference(actor, ((self.vehicle_speed / self.default_speed_limit)) * -100.0)
+            self.tm.vehicle_percentage_speed_difference(actor, ((self.vehicle_speed / self.default_speed_limit) + 1) * -100.0)
             #self.tm.ignore_lights_percentage(actor,100)
             #self.tm.ignore_signs_percentage(actor,100)
             #self.tm.distance_to_leading_vehicle(actor, 0.0)
             #self.tm.ignore_vehicles_percentage(actor, 100.0) 
-            self.tm.set_desired_speed(actor, self.vehicle_speed)
+            #self.tm.set_desired_speed(actor, self.vehicle_speed)
 
         # If we failed to spawn vehicles, try again
         failed_number_of_spawns = number_of_vehicles - len(all_vehicle_actors)
