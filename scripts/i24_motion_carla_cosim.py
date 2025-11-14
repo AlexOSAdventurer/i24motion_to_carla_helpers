@@ -3,7 +3,7 @@ import i24_motion_data
 class I24MotionCARLACoSim:
     initial_visible_time_max_difference = 0.25 # Seconds
     desired_time_max_difference = 1.0 # Seconds
-    deisred_s_max_difference = 20.0 # Meters
+    desired_s_max_difference = 20.0 # Meters
     preload_time_window = 600.0
     preload_s_window = 500
     visible_window = 150 # Meters
@@ -26,12 +26,13 @@ class I24MotionCARLACoSim:
         self.internal_update_state = False
 
     def generateVehicleStateFromRow(self, row, lane):
+        feet_to_meters = 0.3048
         estimated_velocity = self.estimateVehicleVelocityFromReal(int(row["id"]), lane, float(row["time"]))
         return {
             "id": int(row["id"]),
             "class": int(row["class"]),
-            "length": float(row["length"]),
-            "width": float(row["width"]),
+            "length": float(row["length"]) * feet_to_meters,
+            "width": float(row["width"]) * feet_to_meters,
             "time": float(row["time"]),
             "s": float(row["s"]),
             "t": float(row["t"]),
@@ -55,16 +56,19 @@ class I24MotionCARLACoSim:
         }
     
     def getVehicleTrajectoryFromReal(self, id, lane):
-        return self.real_data.getVehicleTrajectoryDF(lane, id)
+        return self.real_data.getVehicleTrajectory(lane, id)
     
     def estimateVehicleVelocityFromReal(self, id, lane, current_time):
         trajectory = self.getVehicleTrajectoryFromReal(id, lane)
         trajectory_time_sorted = trajectory.sort_values(by=['time'], ascending=True)
-        current_index = trajectory_time_sorted['time'].searchsorted(current_time)
+        if len(trajectory_time_sorted) < 2:
+            return float('nan')
+        current_index = int(trajectory_time_sorted['time'].searchsorted(current_time))
+        if (current_index >= len(trajectory_time_sorted)):
+            current_index = len(trajectory_time_sorted) - 1
         if (current_index > 0):
-            return float(trajectory_time_sorted.iloc[current_index]["s"] - trajectory_time_sorted.iloc[current_index - 1]["s"]) / float(trajectory_time_sorted[current_index]["time"] - trajectory_time_sorted[current_index - 1]["time"])
-    
-        return float(trajectory_time_sorted.iloc[current_index + 1]["s"] - trajectory_time_sorted.iloc[current_index]["s"]) / float(trajectory_time_sorted[current_index + 1]["time"] - trajectory_time_sorted[current_index]["time"])
+            return float(trajectory_time_sorted.iloc[current_index]["s"] - trajectory_time_sorted.iloc[current_index - 1]["s"]) / float(trajectory_time_sorted.iloc[current_index]["time"] - trajectory_time_sorted.iloc[current_index - 1]["time"])
+        return float(trajectory_time_sorted.iloc[current_index + 1]["s"] - trajectory_time_sorted.iloc[current_index]["s"]) / float(trajectory_time_sorted.iloc[current_index + 1]["time"] - trajectory_time_sorted.iloc[current_index]["time"])
     
     def estimateGhostVehicleVelocity(self, vehicle_data):
         # Replay its velocity for as long as we have it from the trajectory data - when that expires, we will simply discard the ghost and assume whatever its replacement becomes
@@ -72,7 +76,7 @@ class I24MotionCARLACoSim:
         return self.estimateVehicleVelocityFromReal(self, vehicle_data["id"], vehicle_data["lane"], self.current_timestamp)
 
     def loadHero(self, hero_road, hero_lane, desired_time, desired_s):
-        potential_heroes = self.real_data.queryEdieBoxSubset(desired_time - self.desired_time_max_difference, desired_time + self.desired_time_max_difference, desired_s - self.deisred_s_max_difference, desired_s + self.desired_s_max_difference)[hero_lane]
+        potential_heroes = self.real_data.queryEdieBoxSubset(desired_time - self.desired_time_max_difference, desired_time + self.desired_time_max_difference, desired_s - self.desired_s_max_difference, desired_s + self.desired_s_max_difference)[hero_lane]
         if len(potential_heroes) == 0:
             raise Exception(f"No avaiable heroes with {hero_road} and {hero_lane} and {desired_time} and {desired_s}")
         potential_heroes["time_delta"] = (potential_heroes["time"] - desired_time).abs()
@@ -87,7 +91,7 @@ class I24MotionCARLACoSim:
         return self.current_timestamp, self.current_timestamp + self.initial_visible_time_max_difference, self.hero_state["s"] - self.visible_window, self.hero_state["s"] + self.visible_window
     
     def getCurrentBehindGhostWindow(self):
-        return self.current_timestamp, self.current_timestamp + self.initial_visible_time_max_difference, self.hero_state["s"] - self.visible_window - self.ghost_window, self.hero_state["s"] + self.visible_window
+        return self.current_timestamp, self.current_timestamp + self.initial_visible_time_max_difference, self.hero_state["s"] - self.visible_window - self.ghost_window, self.hero_state["s"] - self.visible_window
     
     def getCurrentAheadGhostWindow(self):
         return self.current_timestamp, self.current_timestamp + self.initial_visible_time_max_difference, self.hero_state["s"] + self.visible_window, self.hero_state["s"] + self.visible_window + self.ghost_window
@@ -100,6 +104,10 @@ class I24MotionCARLACoSim:
         for lane in self.getLanes():
             result[lane] = [id for id in self.visible_state[lane]]
         return result
+    
+    def getVisibleIdsFlat(self):
+        visible_ids = self.getVisibleIds()
+        return sum([visible_ids[lane] for lane in self.getLanes()], [])
     
     def getGhostIds(self):
         result = {
@@ -116,6 +124,9 @@ class I24MotionCARLACoSim:
     
     def getGhostData(self):
         return self.ghost_state
+    
+    def getHeroData(self):
+        return self.hero_state
     
     def getLowestBehindGhostVehicle(self, lane):
         lane_data = self.ghost_state["behind"][lane]
@@ -140,6 +151,30 @@ class I24MotionCARLACoSim:
             if (current_entry["s"] > highest_vehicle["s"]):
                 highest_vehicle = current_entry
         return highest_vehicle
+    
+    def getLowestBehindVisibleVehicle(self, lane):
+        lane_data = self.visible_state[lane]
+        vehicle_ids = list(lane_data.keys())
+        if len(vehicle_ids) == 0:
+            return None
+        lowest_vehicle = lane_data[vehicle_ids[0]]
+        for entry in vehicle_ids[1:]:
+            current_entry = lane_data[entry]
+            if (current_entry["s"] < lowest_vehicle["s"]):
+                lowest_vehicle = current_entry
+        return lowest_vehicle
+    
+    def getHighestAheadVisibleVehicle(self, lane):
+        lane_data = self.visible_state[lane]
+        vehicle_ids = list(lane_data.keys())
+        if len(vehicle_ids) == 0:
+            return None
+        highest_vehicle = lane_data[vehicle_ids[0]]
+        for entry in vehicle_ids[1:]:
+            current_entry = lane_data[entry]
+            if (current_entry["s"] > highest_vehicle["s"]):
+                highest_vehicle = current_entry
+        return highest_vehicle
 
     def loadVisible(self):
         self.visible_state = {}
@@ -151,10 +186,10 @@ class I24MotionCARLACoSim:
             potential_visibles_lane_sorted = potential_visibles[lane].sort_values(by=["time"], ascending=True)
             uniques = list(potential_visibles_lane_sorted["id"].unique())
             for unique in uniques:
-                unique_vehicle_data_row = potential_visibles_lane_sorted[potential_visibles_lane_sorted["id"] == unique][0]
-                self.visible_state[lane][unique] = self.generateVehicleStateFromRow(unique_vehicle_data_row, lane)
+                unique_vehicle_data_row = potential_visibles_lane_sorted[potential_visibles_lane_sorted["id"] == unique].iloc[0]
+                self.visible_state[lane][int(unique)] = self.generateVehicleStateFromRow(unique_vehicle_data_row, lane)
     
-    def loadGhosts(self):
+    def loadGhosts(self, ignore_ids=None):
         self.ghost_state = {
             "behind": {},
             "ahead": {}
@@ -162,23 +197,28 @@ class I24MotionCARLACoSim:
         for lane in self.getLanes():
             self.ghost_state["behind"][lane] = {}
             self.ghost_state["ahead"][lane] = {}
-        self.loadGhostsBehind()
-        self.loadGhostsAhead()
+        self.loadGhostsBehind(ignore_ids)
+        self.loadGhostsAhead(ignore_ids)
 
-    def loadGhostsBehind(self):
+    def loadGhostsBehind(self, ignore_ids=None):
         min_timestamp, max_timestamp, min_s, max_s = self.getCurrentBehindGhostWindow()
-        visible_ids = self.getVisibleIds()
-        visible_ids_merged = sum([visible_ids[lane] for lane in self.getLanes()], [])
+        visible_ids_merged = self.getVisibleIdsFlat()
         potential_ghosts = self.real_data.queryEdieBoxSubset(min_timestamp, max_timestamp, min_s, max_s, visible_ids_merged)
         for lane in self.getLanes():
             potential_ghosts_lane_sorted = potential_ghosts[lane].sort_values(by=["time"], ascending=True)
             uniques = list(potential_ghosts_lane_sorted["id"].unique())
-            for unique in uniques:
-                unique_vehicle_data_row = potential_ghosts_lane_sorted[potential_ghosts_lane_sorted["id"] == unique][0]
+            uniques_filtered = uniques
+            if ignore_ids is not None:
+                uniques_filtered = []
+                for unique in uniques:
+                    if unique not in ignore_ids:
+                        uniques_filtered.append(unique)
+            for unique in uniques_filtered:
+                unique_vehicle_data_row = potential_ghosts_lane_sorted[potential_ghosts_lane_sorted["id"] == unique].iloc[0]
                 new_ghost = self.generateVehicleStateFromRow(unique_vehicle_data_row, lane)
                 self.registerNewGhostVehicle(new_ghost)
 
-    def loadGhostsAhead(self):
+    def loadGhostsAhead(self, ignore_ids=None):
         min_timestamp, max_timestamp, min_s, max_s = self.getCurrentAheadGhostWindow()
         visible_ids = self.getVisibleIds()
         visible_ids_merged = sum([visible_ids[lane] for lane in visible_ids], [])
@@ -186,8 +226,14 @@ class I24MotionCARLACoSim:
         for lane in self.getLanes():
             potential_ghosts_lane_sorted = potential_ghosts[lane].sort_values(by=["time"], ascending=True)
             uniques = list(potential_ghosts_lane_sorted["id"].unique())
-            for unique in uniques:
-                unique_vehicle_data_row = potential_ghosts_lane_sorted[potential_ghosts_lane_sorted["id"] == unique][0]
+            uniques_filtered = uniques
+            if ignore_ids is not None:
+                uniques_filtered = []
+                for unique in uniques:
+                    if unique not in ignore_ids:
+                        uniques_filtered.append(unique)
+            for unique in uniques_filtered:
+                unique_vehicle_data_row = potential_ghosts_lane_sorted[potential_ghosts_lane_sorted["id"] == unique].iloc[0]
                 new_ghost = self.generateVehicleStateFromRow(unique_vehicle_data_row, lane)
                 self.registerNewGhostVehicle(new_ghost)
 
@@ -196,6 +242,7 @@ class I24MotionCARLACoSim:
         self.internal_update_state = True
         self.updateHeroVehicleViaCARLA(new_hero_state)
         self.updateVisibleVehiclesViaCARLA(new_visible_states)
+        self.updateVisibleVehiclesViaGhosts()
         self.moveGhostVehiclesAndUpdateRoster()
         self.internal_update_state = False
 
@@ -234,20 +281,76 @@ class I24MotionCARLACoSim:
                     new_data = self.generateUpdatedVehicleStateFromCARLA(vehicle_data)
                     visible_state_updated[new_data["lane"]] = new_data
 
-    def registerNewGhostVehicle(self, vehicle_data):
+    def updateVisibleVehiclesWithGhostSelection(self, ghost_data):
+        visible_window = self.getCurrentVisibleWindow()
+        for lane in self.getLanes():
+            for id in ghost_data[lane]:
+                candidate = ghost_data[lane][id]
+                if (candidate["s"] > visible_window[2]) and (candidate["s"] < visible_window[3]):
+                    if (self.checkIfCandidateVisibleNoOverlapWithCurrentVisible(lane, candidate)):
+                        self.registerNewVisibleVehicle(candidate)
+                        # No need to remove. Will be dealt with when we reload the ghost data.
+
+    def updateVisibleVehiclesViaGhosts(self):
+        # For each ghost vehicle, we will estimate its projected future position with a simple change to s.
+        # Then, we will see if they fall under the visible region. If so, attempt to admit them, as long as geometry permits it.
+        # Check behind vehicles
+        self.updateVisibleVehiclesWithGhostSelection(self.ghost_state["behind"])
+        # Check ahead vehicles
+        self.updateVisibleVehiclesWithGhostSelection(self.ghost_state["ahead"])
+
+    def checkVehicleBoundingBoxNoOverlap(self, vehicle1, vehicle2):
+        vehicle_first = vehicle1 if (vehicle1["s"] < vehicle2["s"]) else vehicle2
+        vehicle_second = vehicle1 if (vehicle1["s"] > vehicle2["s"]) else vehicle2 
+        vehicle_first_min, vehicle_first_max = vehicle_first["s"], vehicle_first["s"] + vehicle_first["length"]
+        vehicle_second_min, vehicle_second_max = vehicle_second["s"], vehicle_second["s"] + vehicle_second["length"]
+
+        return (vehicle_first_min < vehicle_second_min) and (vehicle_first_max < vehicle_second_min)
+    
+    def checkIfCandidateGhostNoOverlapWithCurrentGhosts(self, ghost_data, candidate):
+        for id in ghost_data:
+            if not self.checkVehicleBoundingBoxNoOverlap(ghost_data[id], candidate):
+                return False
+        return True
+    
+    def checkIfCandidateVisibleNoOverlapWithCurrentVisible(self, lane, candidate):
+        # Create a 1d bounding box for the lane that covers the backmost visible vehicle to the frontmost one. We cannot breach this.
+        lowest_vehicle = self.getLowestBehindVisibleVehicle(lane)
+        highest_vehicle = self.getHighestAheadVisibleVehicle(lane)
+        if lowest_vehicle is None:
+            lowest_vehicle = self.getHeroData()
+            highest_vehicle = self.getHeroData()
+        return ((candidate["s"] + candidate["length"]) < lowest_vehicle["s"]) or (candidate["s"] > (highest_vehicle["s"] + highest_vehicle["length"]))
+    
+    def registerNewVisibleVehicle(self, vehicle_data, ignore_invalid_ghost_cell_position=False):
+        if vehicle_data["id"] in self.vehicles_to_completely_ignore:
+            return
+        visible_window = self.getCurrentVisibleWindow()
+        # Are we inside?
+        if (vehicle_data["s"] > visible_window[2]) and (vehicle_data["s"] < visible_window[3]):
+            if ignore_invalid_ghost_cell_position or self.checkIfCandidateVisibleNoOverlapWithCurrentVisible(vehicle_data["lane"], vehicle_data):
+                self.visible_state[vehicle_data["lane"]][vehicle_data["id"]] = vehicle_data
+            else:
+                print(f"WARNING: Threw away {vehicle_data} because it was in an invalid visible position")
+                self.vehicles_to_completely_ignore.append(vehicle_data["id"]) # Permanently throw away
+        else:
+            print(f"WARNING: Threw away {vehicle_data} because it wasn't in a valid visible position")
+            self.vehicles_to_completely_ignore.append(vehicle_data["id"]) # Permanently throw away
+
+    def registerNewGhostVehicle(self, vehicle_data, ignore_invalid_ghost_cell_position=False):
+        if vehicle_data["id"] in self.vehicles_to_completely_ignore:
+            return
         behind_ghost_window = self.getCurrentBehindGhostWindow()
         ahead_ghost_window = self.getCurrentAheadGhostWindow()
         # Are we in the behind ghost cell?
         if (vehicle_data["s"] >= behind_ghost_window[2]) and (vehicle_data["s"] <= behind_ghost_window[3]):
-            lowest_vehicle = self.getLowestBehindGhostVehicle(vehicle_data["lane"])
-            if (lowest_vehicle["s"] > vehicle_data["s"]):
+            if ignore_invalid_ghost_cell_position or self.checkIfCandidateGhostNoOverlapWithCurrentGhosts(self.ghost_state["behind"][vehicle_data["lane"]], vehicle_data):
                 self.ghost_state["behind"][vehicle_data["lane"]][vehicle_data["id"]] = vehicle_data
             else:
                 print(f"WARNING: Threw away {vehicle_data} because it was in an invalid behind ghost cell position")
                 self.vehicles_to_completely_ignore.append(vehicle_data["id"]) # Permanently throw away
         elif (vehicle_data["s"] >= ahead_ghost_window[2]) and (vehicle_data["s"] <= ahead_ghost_window[3]):
-            highest_vehicle = self.getHighestAheadGhostVehicle(vehicle_data["lane"])
-            if (highest_vehicle["s"] < vehicle_data["s"]):
+            if ignore_invalid_ghost_cell_position or self.checkIfCandidateGhostNoOverlapWithCurrentGhosts(self.ghost_state["ahead"][vehicle_data["lane"]], vehicle_data):
                 self.ghost_state["ahead"][vehicle_data["lane"]][vehicle_data["id"]] = vehicle_data
             else:
                 print(f"WARNING: Threw away {vehicle_data} because it was in an invalid ahead ghost cell position")
@@ -259,5 +362,5 @@ class I24MotionCARLACoSim:
     def moveGhostVehiclesAndUpdateRoster(self):
         # We simply reload what the valid ghost region is from the data available.
         # This implicitly moves and deletes the vehicles in the roster as they disappear
-        self.loadGhostsBehind()
-        self.loadGhostsAhead()
+        # The only difference is that we ignore vehicles currently in the visible range. CARLA manages them.
+        self.loadGhosts(self.getVisibleIdsFlat())
