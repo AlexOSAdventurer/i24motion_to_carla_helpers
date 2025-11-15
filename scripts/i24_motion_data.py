@@ -2,6 +2,7 @@ import pyarrow.parquet as pq
 import duckdb
 import pandas
 import os
+import sys
 
 class I24MotionData:
     trajectories_all_db_prefix = "trajectories_all"
@@ -57,10 +58,34 @@ class I24MotionData:
         """
         return self.conn.execute(q, [timestamp_min, timestamp_max, s_min, s_max])
     
-    def queryEdieBoxSubset(self, timestamp_min, timestamp_max, s_min, s_max):
+    def getVehicleTrajectoryDF(self, source_ref, id):
+        q = f"""
+        SELECT time, x, y, length, width, height, class, id, s, t
+        FROM {source_ref}
+        WHERE id = ?
+        ORDER BY time ASC
+        """
+        return self.conn.execute(q, [id]).fetch_df()
+    
+    def getVehicleTrajectory(self, lane, id):
+        lane_str = str(lane) if lane >= 0 else "neg"+str(abs(lane))
+        source_ref = f"{self.trajectories_subset_db_prefix}_{self.road_id}_{lane_str}"
+        return self.getVehicleTrajectoryDF(source_ref, id)
+    
+    def queryEdieBoxSubset(self, timestamp_min, timestamp_max, s_min, s_max, ignore_ids = None):
         result = {}
         for lane in self.road_lane_lookup[self.road_id]:
             lane_str = str(lane) if lane >= 0 else "neg"+str(abs(lane))
             source_ref = f"{self.trajectories_subset_db_prefix}_{self.road_id}_{lane_str}"
             result[lane] = self.directQueryEdieBoxDF(source_ref, timestamp_min, timestamp_max, s_min, s_max)
+            # Each unique id needs at least two rows corresponding to it so we can estimate velocity and justifiably say it's a reliable track
+            unique_ids = list(result[lane]["id"].unique())
+            for id in unique_ids:
+                subset = result[lane][result[lane]["id"] == id]
+                if (len(subset) < 2):
+                    result[lane] = result[lane][result[lane]["id"] != id]
+            if ignore_ids is not None:
+                for ignore_id in ignore_ids:
+                    result[lane] = result[lane][result[lane]["id"] != ignore_id]
         return result
+    
