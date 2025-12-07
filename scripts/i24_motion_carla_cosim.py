@@ -158,6 +158,18 @@ class I24MotionCARLACoSim:
                 highest_vehicle = current_entry
         return highest_vehicle
     
+    def getLowestAheadGhostVehicle(self, lane):
+        lane_data = self.ghost_state["ahead"][lane]
+        vehicle_ids = list(lane_data.keys())
+        if len(vehicle_ids) == 0:
+            return None
+        lowest_vehicle = lane_data[vehicle_ids[0]]
+        for entry in vehicle_ids[1:]:
+            current_entry = lane_data[entry]
+            if (current_entry["s"] < lowest_vehicle["s"]):
+                lowest_vehicle = current_entry
+        return lowest_vehicle
+    
     def getLowestBehindVisibleVehicle(self, lane):
         lane_data = self.visible_state[lane]
         vehicle_ids = list(lane_data.keys())
@@ -279,9 +291,9 @@ class I24MotionCARLACoSim:
                 behind_ghost_window = self.getCurrentBehindGhostWindow()
                 ahead_ghost_window = self.getCurrentAheadGhostWindow()
                 if (vehicle_data["s"] < behind_ghost_window[2]):
-                    #print(f"WARNING: Threw away {vehicle_data} because it was visible but then slipped behind the behind ghost cell!")
-                    self.vehicles_to_completely_ignore.append(vehicle_id)
-                    continue # Throw away this vehicle from now on
+                    print(f"WARNING: Threw away {vehicle_data} because it was visible but then slipped behind the behind ghost cell!")
+                    #self.vehicles_to_completely_ignore.append(vehicle_id)
+                    #continue # Throw away this vehicle from now on
                 # Did we slip into the behind ghost cell?
                 elif (vehicle_data["s"] < behind_ghost_window[3]):
                     self.registerNewGhostVehicle(vehicle_data)
@@ -290,9 +302,9 @@ class I24MotionCARLACoSim:
                     self.registerNewGhostVehicle(vehicle_data)
                 # Did we slip past the ahead ghost cell?
                 elif (vehicle_data["s"] > ahead_ghost_window[3]):
-                    #print(f"WARNING: Threw away {vehicle_data} because it was visible but then slipped ahead the ahead ghost cell!")
-                    self.vehicles_to_completely_ignore.append(vehicle_id)
-                    continue # Throw away this vehicle from now on
+                    print(f"WARNING: Threw away {vehicle_data} because it was visible but then slipped ahead the ahead ghost cell!")
+                    #self.vehicles_to_completely_ignore.append(vehicle_id)
+                    #continue # Throw away this vehicle from now on
                 # Vehicle still in visible region
                 else:
                     new_data = self.generateUpdatedVehicleStateFromCARLA(vehicle_data)
@@ -304,14 +316,13 @@ class I24MotionCARLACoSim:
             for id in ghost_data[lane]:
                 candidate = ghost_data[lane][id]
                 candidate_new_s = candidate["s"] + (candidate["velocity"] * (self.current_timestamp - candidate["time"]))
-                #print(f"Candidate visible {candidate} which is a ghost has a projected {candidate_new_s} position with this window {visible_window}")
+                print(f"Candidate visible {candidate} which is a ghost has a projected {candidate_new_s} position with this window {visible_window}")
                 if (candidate_new_s > visible_window[2]) and (candidate_new_s < visible_window[3]):
                     if (self.checkIfCandidateVisibleNoOverlapWithCurrentVisible(lane, candidate)):
                         candidate["s"] = candidate_new_s
                         self.registerNewVisibleVehicle(candidate)
                     else:
-                        pass
-                        #print(f"WARNING: Threw away {candidate} visible vehicle because it overlapped with the other visible vehicles!")
+                        print(f"WARNING: Threw away {candidate} visible vehicle because it overlapped with the other visible vehicles!")
                         # No need to remove. Will be dealt with when we reload the ghost data.
 
     def updateVisibleVehiclesViaGhosts(self):
@@ -350,13 +361,12 @@ class I24MotionCARLACoSim:
             return True
         result = ((candidate["s"] + candidate["length"]) < lowest_vehicle["s"]) or (candidate["s"] > (highest_vehicle["s"] + highest_vehicle["length"]))
         if not result:
-            pass
-            #print(f"WARNING: Threw away {candidate} because it was in an invalid visible position with respect to {lowest_vehicle} and {highest_vehicle}.\n")
+            print(f"WARNING: Threw away {candidate} because it was in an invalid visible position with respect to {lowest_vehicle} and {highest_vehicle}.\n")
         return result
     
     def registerNewVisibleVehicle(self, vehicle_data, ignore_invalid_visible_cell_position=False):
         if vehicle_data["id"] in self.vehicles_to_completely_ignore:
-            #print(f"WARNING: Threw away visible {vehicle_data} because it was marked as a vehicle to ignore.")
+            print(f"WARNING: Threw away visible {vehicle_data} because it was marked as a vehicle to ignore.")
             return
         visible_window = self.getCurrentVisibleWindow()
         # Are we inside?
@@ -364,11 +374,11 @@ class I24MotionCARLACoSim:
             if ignore_invalid_visible_cell_position or self.checkIfInitVisibleNoOverlapWithCurrentVisible(vehicle_data["lane"], vehicle_data):
                 self.visible_state[vehicle_data["lane"]][vehicle_data["id"]] = vehicle_data
             else:
-                #print(f"WARNING: Threw away {vehicle_data} because it was in an invalid visible position")
-                self.vehicles_to_completely_ignore.append(vehicle_data["id"]) # Permanently throw away
+                print(f"WARNING: Threw away {vehicle_data} because it was in an invalid visible position")
+                #self.vehicles_to_completely_ignore.append(vehicle_data["id"]) # Permanently throw away
         else:
-            #print(f"WARNING: Threw away {vehicle_data} because it wasn't in a valid visible position")
-            self.vehicles_to_completely_ignore.append(vehicle_data["id"]) # Permanently throw away
+            print(f"WARNING: Threw away {vehicle_data} because it wasn't in a valid visible position")
+            #self.vehicles_to_completely_ignore.append(vehicle_data["id"]) # Permanently throw away
 
     def registerNewGhostVehicle(self, vehicle_data, ignore_invalid_ghost_cell_position=False):
         if vehicle_data["id"] in self.vehicles_to_completely_ignore:
@@ -381,17 +391,16 @@ class I24MotionCARLACoSim:
             if ignore_invalid_ghost_cell_position or self.checkIfCandidateGhostNoOverlapWithCurrentGhosts(self.ghost_state["behind"][vehicle_data["lane"]], vehicle_data):
                 self.ghost_state["behind"][vehicle_data["lane"]][vehicle_data["id"]] = vehicle_data
             else:
-                #print(f"WARNING: Threw away {vehicle_data} because it was in an invalid behind ghost cell position")
-                self.vehicles_to_completely_ignore.append(vehicle_data["id"]) # Permanently throw away
+                print(f"WARNING: Threw away {vehicle_data} because it was in an invalid behind ghost cell position")
+                #self.vehicles_to_completely_ignore.append(vehicle_data["id"]) # Permanently throw away
         elif (vehicle_data["s"] >= ahead_ghost_window[2]) and (vehicle_data["s"] <= ahead_ghost_window[3]):
             if ignore_invalid_ghost_cell_position or self.checkIfCandidateGhostNoOverlapWithCurrentGhosts(self.ghost_state["ahead"][vehicle_data["lane"]], vehicle_data):
                 self.ghost_state["ahead"][vehicle_data["lane"]][vehicle_data["id"]] = vehicle_data
             else:
-                #print(f"WARNING: Threw away {vehicle_data} because it was in an invalid ahead ghost cell position")
-                self.vehicles_to_completely_ignore.append(vehicle_data["id"]) # Permanently throw away
+                print(f"WARNING: Threw away {vehicle_data} because it was in an invalid ahead ghost cell position")
+                #self.vehicles_to_completely_ignore.append(vehicle_data["id"]) # Permanently throw away
         else:
-            pass
-            #print(f"WARNING: Threw away {vehicle_data} because it wasn't in a valid ghost position")
+            print(f"WARNING: Threw away {vehicle_data} because it wasn't in a valid ghost position")
             # Don't permanently pitch it. It might appear in a useful spot later.
             #self.vehicles_to_completely_ignore.append(vehicle_data["id"]) # Permanently throw away
 
