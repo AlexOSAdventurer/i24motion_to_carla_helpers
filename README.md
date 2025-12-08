@@ -3,6 +3,7 @@ This repository allows you to simulate in CARLA real world traffic data from I-2
 
 ## Download
 Run:
+
         git clone https://github.com/AlexOSAdventurer/i24motion_to_carla_helpers.git
 
 ## Installation and Use
@@ -12,6 +13,7 @@ This overall stack and framework is used within the compiled CARLA docker image 
 ### CARLA download
 We use a slightly patched version of CARLA 0.9.16 - it is already added as a submodule within this repo.
 To download this version of CARLA and download the I-24 map used, run:
+
         git submodule init
         git submodule update
 
@@ -32,6 +34,7 @@ This will launch the docker image shell. CARLA and the i24motion_to_carla subfol
 The I-24 motion data is post-processed into a parquet dataset to enable real-time lookup of trajectories with respect to time and space bounding boxes (as in, a bounding box on a time-space traffic diagram), even when the dataset is large. The cost is that it can take several minutes of initial preprocessing before you can use it - the reward is that you only run it once, then never again. 
 
 Run in the CARLA docker container:
+
         cd /workspaces/i24motion_to_carla/scripts
         python3.8 process_i24_motion_data.py
 
@@ -39,11 +42,13 @@ This will result in a "road_data" folder being created inside of the scripts fol
 
 #### Run simulation
 In one shell within the container, launch CARLA with `make launch` and in the other shell, do:
+
         cd /workspaces/i24motion_to_carla/scripts
         python3.8 i24_motion_carla.py
 
 This will generate the result CSVs and Bird's Eye View videos from the paper.
 Then, execute:
+
         python3.8 generate_result_figures.py
 
 This will generate the corresponding graphs.
