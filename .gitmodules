@@ -2,7 +2,3 @@
 	path = carla-0.9.16
 	url = https://github.com/AlexOSAdventurer/carla.git
 	branch = 0.9.16_TrafficWaves
-[submodule "UnrealEngine_4.26"]
-	path = UnrealEngine_4.26
-	url = https://github.com/CarlaUnreal/UnrealEngine.git
-	branch = carla

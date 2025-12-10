@@ -20,7 +20,12 @@ Then do:
         git submodule init
         git submodule update
 
-To download the CARLA and Unreal Engine branches.
+To download the CARLA branch.
+
+To download Unreal, do this after:
+
+        ./download_Unreal.sh
+
 
 ## Installation and Use
 
