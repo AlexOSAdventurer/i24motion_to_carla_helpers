@@ -26,6 +26,11 @@ To download the CARLA and Unreal Engine branches.
 
 This overall stack and framework is used within the compiled CARLA docker image - Utils/Docker/run.sh. 
 
+### Build Unreal (outside of Docker)
+
+Since we use devcontainers for this, Unreal Engine has to be precompiled on your local machine, outside of Docker, following this guide:
+[https://carla.readthedocs.io/en/latest/build_linux/#building-unreal-engine](https://carla.readthedocs.io/en/latest/build_linux/#building-unreal-engine).
+
 ### I-24 Motion Dataset Download
 Go to https://i24motion.org/ and setup an account - this is necessary to ensure you agree to how this data is used. Then, go to https://i24motion.org/access_data and download 11-30-2022. Unzip 11-30-2022 to the i24motion_to_carla/i24motion_to_carla/11-30-2022 path. 
 
