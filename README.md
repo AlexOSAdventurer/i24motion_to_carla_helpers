@@ -24,7 +24,7 @@ To download the CARLA branch.
 
 To download Unreal, do this after:
 
-        ./download_Unreal.sh
+        ./download_Unreal.sh <YOUR OAUTH GITHUB TOKEN>
 
 
 ## Installation and Use
