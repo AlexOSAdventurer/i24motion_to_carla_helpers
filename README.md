@@ -10,7 +10,7 @@ with Epic Games as per this guide here: [https://www.unrealengine.com/en-US/ue-o
 ## Download
 Run:
 
-        git clone https://github.com/AlexOSAdventurer/i24motion_to_carla_helpers.git
+        git clone https://<your-access-token>@github.com/AlexOSAdventurer/i24motion_to_carla_helpers.git
 
 It comes with the CARLA branch and Unreal Engine source linked as submodules.
 
