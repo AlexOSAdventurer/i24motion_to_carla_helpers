@@ -722,12 +722,12 @@ class I24MotionCarlaSimulation:
             print(f"Saving {len(self.trajectory_data)} records to CSV at {self.trajectory_output_path}!")
             self.trajectory_data.to_csv(self.trajectory_output_path, index=False, header=True)
 
-            print(f"Saving BEV video at {self.bev_video_output_path}")
-            make_video_from_snapshots(self.i24_cosim, self.cosim_snapshot, self.cosim_bounds, fps=int(1.0 / self.tick_step), out_path=self.bev_video_output_path)
+            #print(f"Saving BEV video at {self.bev_video_output_path}")
+            #make_video_from_snapshots(self.i24_cosim, self.cosim_snapshot, self.cosim_bounds, fps=int(1.0 / self.tick_step), out_path=self.bev_video_output_path)
 
 # Screenshots at 10 s of the sim
 if __name__ == "__main__":
-    sim = I24MotionCarlaSimulation("localhost", 2000, 1, -2, 1669812350, 300, "../i24_motion_to_carla_mapping_adjusted_origin.json", "result_new_road_1_lane_2.csv", "result_bev_road_1_lane_2.mp4")
-    sim.launchSimulation()
+    #sim = I24MotionCarlaSimulation("localhost", 2000, 1, -2, 1669812350, 300, "../i24_motion_to_carla_mapping_adjusted_origin.json", "result_new_road_1_lane_2.csv", "result_bev_road_1_lane_2.mp4")
+    #sim.launchSimulation()
     sim = I24MotionCarlaSimulation("localhost", 2000, 2, -1, 1669812350, 700, "../i24_motion_to_carla_mapping_adjusted_origin.json", "result_new_road_2_lane_1.csv", "result_bev_road_2_lane_1.mp4")
     sim.launchSimulation()
