@@ -1,0 +1,6 @@
+pandas
+pyarrow
+rtree
+matplotlib
+moviepy
+duckdb
