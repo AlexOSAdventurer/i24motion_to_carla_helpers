@@ -83,7 +83,6 @@ def make_video_from_snapshots(cosim, snapshots, bounds, fps, out_path):
     clip.write_videofile(out_path, fps=fps, codec="libx264")
 
 class I24MotionCarlaSimulationCoupled:
-    visible_lead_vehicle_follow_ghost_window = 80.0 # If 80.0 meters within the lead ghost window, mirror the ghost vehicle velocity
     episode_length = 30.0
     mile_to_feet = 5280.0
     feet_to_meters = 0.3048
@@ -440,7 +439,7 @@ class I24MotionCarlaSimulationCoupled:
     def despawnCARLAVehicle(self, vehicle_state):
         self.client.apply_batch_sync([carla.command.DestroyActor(vehicle_state["carla_actor_id"])])
 
-    def pushVehicle(self, vehicle_state, speed):
+    def pushVehicleImpulse(self, vehicle_state, speed):
         vehicle_id = vehicle_state["carla_actor_id"]
         vehicle_actor = self.world.get_actors([vehicle_id])[0]
         actor_transform = vehicle_actor.get_transform()
@@ -464,6 +463,24 @@ class I24MotionCarlaSimulationCoupled:
         batch.append(carla.command.SetAutopilot(vehicle_id, True, self.tm_port))
         self.client.apply_batch_sync(batch, False)
         print(f"At time {self.world.get_snapshot().timestamp} Pushed {vehicle_state} by {speed} with mass of {mass} and speed of {speed} and transform of {actor_transform}")
+
+    def pushVehicle(self, vehicle_state, speed):
+        vehicle_id = vehicle_state["carla_actor_id"]
+        vehicle_actor = self.world.get_actors([vehicle_id])[0]
+        actor_transform = vehicle_actor.get_transform()
+        actor_transform.rotation.roll = 0.0
+        actor_transform.rotation.pitch = 0.0
+        actor_transform.location.z += 0.1
+        batch = [
+            carla.command.ApplyTransform(vehicle_id, actor_transform),
+            carla.command.SetAutopilot(vehicle_id, False, self.tm_port)
+        ]
+        self.client.apply_batch_sync(batch, False)
+        vehicle_actor.enable_constant_velocity(
+            carla.Vector3D(x=speed, y=0.0, z=0.0)
+        )
+
+        print(f"At time {self.world.get_snapshot().timestamp} Pushed {vehicle_state} by {speed} and transform of {actor_transform}")
     
     def spawnHeroVehicle(self, blueprint_id=None):
         cosim_data = self.coupler.getHeroData()
@@ -583,27 +600,33 @@ class I24MotionCarlaSimulationCoupled:
         cosim_lead_vehicles = {}
         cosim_nominal_vehicle_actor_ids = []
         road_str = str(self.coupler.hero_road)
+        min_s, max_s = self.coupler.getCurrentVisibleWindow()[2:]
+        middle_s = (max_s + min_s) / 2.0
         for lane_count in range(1, self.mapping[road_str]["lanes"] + 1):
             lane_id = lane_count * -1
             potential_cosim_vehicles = [self.visible_states[cosim_id] for cosim_id in self.visible_states if self.visible_states[cosim_id]["cosim_data"]["lane_id"] == lane_id]
             potential_cosim_vehicles_sorted = sorted(potential_cosim_vehicles, key=lambda entry: entry["cosim_data"]["s"], reverse=True)
-            cosim_lead_vehicles[lane_id] = []
+            cosim_lead_vehicles[lane_id] = None
             for entry in potential_cosim_vehicles_sorted:
                 if (entry["carla_actor_id"] != self.hero_state["carla_actor_id"]) \
-                and (entry["cosim_data"]["s"] >= (self.coupler.getCurrentAheadGhostWindow()[2] - self.visible_lead_vehicle_follow_ghost_window)):
-                    cosim_lead_vehicles[lane_id].append(entry)
-                else:
+                and (entry["cosim_data"]["s"] <= max_s) \
+                and (entry["cosim_data"]["s"] > middle_s):
+                    if (cosim_lead_vehicles[lane_id] is None) or (cosim_lead_vehicles[lane_id]["cosim_data"]["s"] < entry["cosim_data"]["s"]):
+                        cosim_lead_vehicles[lane_id] = entry
+            for entry in potential_cosim_vehicles_sorted:
+                if (cosim_lead_vehicles[lane_id] is None) or (entry["carla_actor_id"] != cosim_lead_vehicles[lane_id]["carla_actor_id"]):
                     cosim_nominal_vehicle_actor_ids.append(entry["carla_actor_id"])
+
         for actor_id in cosim_nominal_vehicle_actor_ids:
             cosim_actor = self.world.get_actors([actor_id])[0]
             self.tm.set_desired_speed(cosim_actor, self.hero_vehicle_speed)
         for lane_count in range(1, self.mapping[road_str]["lanes"] + 1):
             lane_id = lane_count * -1
-            cosim_lane_lead_vehicles = cosim_lead_vehicles[lane_id]
+            cosim_lane_lead_vehicle = cosim_lead_vehicles[lane_id]
             cosim_ghost_lead_state = self.coupler.getLowestAheadGhostVehicle(lane_id)
-            cosim_ghost_lead_velocity = cosim_ghost_lead_state["velocity"] * self.mps_to_kph if cosim_ghost_lead_state is not None else self.coupler.getAheadLaneVelocity(lane_id)
-            for entry in cosim_lane_lead_vehicles:
-                cosim_actor = self.world.get_actors([entry["carla_actor_id"]])[0]
+            cosim_ghost_lead_velocity = cosim_ghost_lead_state["velocity"] * self.mps_to_kph if cosim_ghost_lead_state is not None else self.coupler.getAheadLaneVelocity(lane_id, self.hero_vehicle_speed)
+            if cosim_lane_lead_vehicle is not None:
+                cosim_actor = self.world.get_actors([cosim_lane_lead_vehicle["carla_actor_id"]])[0]
                 self.tm.set_desired_speed(cosim_actor, cosim_ghost_lead_velocity)
 
     def updateCoSIM(self):
@@ -697,12 +720,19 @@ class I24MotionCarlaSimulationCoupled:
                 self.visible_states[cosim_id]["pushed"] = True
 
     def initializeSimulation(self):
+        # Find all actors and filter for those starting with 'vehicle.'
+        vehicle_list = self.world.get_actors().filter('vehicle.*')
+
+        # Destroy all found vehicles using a batch command for efficiency
+        self.client.apply_batch([carla.command.DestroyActor(x.id) for x in vehicle_list])
+        
+        print(f'Successfully destroyed {len(vehicle_list)} vehicles.')
         self.spawnHeroVehicle("vehicle.audi.a2") # Lets keep us at it an audi for now ;)!
         self.spawnAndDespawnVisibleVehiclesFromCoSIM()
 
     def runSimulationOver(self, t=1.0):
         starting_timestamp = self.current_timestamp
-        hero_rebuilt, visible_rebuilt = None, None
+        hero_rebuilt, visible_rebuilt = self.updateCoSIM()
         while (self.current_timestamp < (starting_timestamp + t)):
             self.updateHeroAndVisibleVehiclesFromTM()
             self.world.tick()
@@ -712,6 +742,7 @@ class I24MotionCarlaSimulationCoupled:
             hero_rebuilt, visible_rebuilt = self.updateCoSIM()
             self.current_timestamp += self.tick_step
         print(self.current_timestamp)
+        #print(hero_rebuilt, visible_rebuilt)
         return hero_rebuilt, visible_rebuilt
     
     def updateSimulation(self):
