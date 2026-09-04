@@ -4,3 +4,5 @@ rtree
 matplotlib
 moviepy
 duckdb
+opencv-python
+numpy
