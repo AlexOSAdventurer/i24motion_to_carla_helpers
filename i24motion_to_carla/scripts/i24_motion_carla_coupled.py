@@ -2,6 +2,9 @@ import json
 import numpy
 import pandas
 import carla
+import cv2
+import imageio
+import queue
 import math
 import time
 from . import  i24_motion_carla_cosim
@@ -83,17 +86,15 @@ def make_video_from_snapshots(cosim, snapshots, bounds, fps, out_path):
     clip.write_videofile(out_path, fps=fps, codec="libx264")
 
 class I24MotionCarlaSimulationCoupled:
-    episode_length = 30.0
     mile_to_feet = 5280.0
     feet_to_meters = 0.3048
     mps_to_kph = 3.6
     waypoint_distance = 0.1 # Meters
-    tick_step = 0.01
+    tick_step = 1.0/30.0
     lead_distance = 2.0
-    #hero_vehicle_speed = 128.748 # kph
+    FPS = 30.0
     hero_vehicle_speed = 144.841 # kph
-    default_speed_limit = 30.0 # kph
-    spawn_z_offset = 0.75 # Meters
+    spawn_z_offset = 0.25 # Meters
     vehicle_blueprints_selection = ['vehicle.audi.a2', 
                                     'vehicle.mercedes.coupe_2020', 
                                     'vehicle.dodge.charger_police', 
@@ -300,7 +301,7 @@ class I24MotionCarlaSimulationCoupled:
         }
     }
     
-    def __init__(self, host, port, coupler, mapping, trajectory_output_path, bev_video_output_path):
+    def __init__(self, host, port, coupler, mapping, carla_video_output_prefix, record_videos=True):
         self.host = host
         self.port = port
         self.tm_port = 8000
@@ -308,16 +309,19 @@ class I24MotionCarlaSimulationCoupled:
         self.world = None
         self.carla_map = None
         self.hero_state = None
+        self.record_videos = record_videos
+        self.hero_cameras = {}
+        self.hero_camera_queues = {}
+        self.hero_camera_writers = {}
         self.visible_states = None
         self.coupler = coupler
         self.cosim_snapshot = []
         self.cosim_bounds = []
         self.current_timestamp = 0.0
-        self.connectToHost()
+        self.connect_to_host()
         self.mapping = mapping
-        self.time_origin = self.coupler.getHeroData()["time"]
-        self.trajectory_output_path = trajectory_output_path
-        self.bev_video_output_path = bev_video_output_path
+        self.time_origin = self.coupler.get_hero_data()["time"]
+        self.carla_video_output_prefix = carla_video_output_prefix
         self.trajectory_data = pandas.DataFrame(
             {
                 "simulation_time": pandas.Series(dtype="float"),
@@ -330,27 +334,31 @@ class I24MotionCarlaSimulationCoupled:
                 "hero_status": pandas.Series(dtype="int")
             }
         )
-        self.spawn_points = self.loadSpawnPointsForRoad()
-        self.vehicle_blueprints = self.getVehicleBlueprints()
+        self.spawn_points = self.load_spawn_points_for_road()
+        self.vehicle_blueprints = self.get_vehicle_blueprints()
 
-    def connectToHost(self):
+    def connect_to_host(self):
         self.client = carla.Client(self.host, self.port)
         self.client.set_timeout(10.0)
         self.world = self.client.get_world()
         self.carla_map = self.world.get_map()
         settings = self.world.get_settings()
         settings.synchronous_mode = True
+        settings.substepping = True
+        settings.max_substep_delta_time = self.tick_step / 10.0
+        settings.max_substeps = 10
         settings.fixed_delta_seconds = self.tick_step
         settings.no_rendering_mode = False
         self.tm = self.client.get_trafficmanager(self.tm_port)
         self.tm.set_random_device_seed(42)
+        numpy.random.seed(42)
         self.tm.set_global_distance_to_leading_vehicle(self.lead_distance)
         self.tm.global_percentage_speed_difference(0.0)
         self.tm.set_synchronous_mode(True)
         self.world.apply_settings(settings)
         self.world.tick()
 
-    def loadSpawnPointsForRoad(self):
+    def load_spawn_points_for_road(self):
         spawn_points = {}
         waypoints = self.carla_map.generate_waypoints(self.waypoint_distance)
         for road_str in self.mapping:
@@ -363,7 +371,7 @@ class I24MotionCarlaSimulationCoupled:
                 spawn_points[road_id][lane_id] = sorted_waypoints
         return spawn_points
 
-    def convertCarlaLocationToOpenDRIVELocation(self, location, blueprint_id):
+    def convert_carla_location_to_open_drive_location(self, location, blueprint_id):
         # Assume no lateral movement - we don't compute t
         closest_waypoint = self.carla_map.get_waypoint(location, project_to_road=True)
         s_delta = self.vehicle_blueprints_bounds[blueprint_id]["xmin"] if blueprint_id is not None else 0.0
@@ -373,73 +381,93 @@ class I24MotionCarlaSimulationCoupled:
             "s": closest_waypoint.s + s_delta,
         }
     
-    def getSpawnWaypointForOpenDRIVELocation(self, opendrive_location):
+    def get_spawn_waypoint_for_open_drive_location(self, opendrive_location):
         # Assume no lateral movement - we don't compute t
         available_waypoints = self.spawn_points[opendrive_location["road_id"]][opendrive_location["lane_id"]]
         s_index = int(opendrive_location["s"] // self.waypoint_distance)
         return available_waypoints[s_index]
     
-    def getVehicleBlueprints(self):
+    def get_vehicle_blueprints(self):
         vehicle_blueprints = {bp.id: bp for bp in self.world.get_blueprint_library().filter('vehicle*') 
                               if bp.id in self.vehicle_blueprints_selection}
         return vehicle_blueprints
     
-    def generateOpenDRIVELocationFromState(self, cosim_vehicle_state):
+    def generate_open_drive_location_from_state(self, cosim_vehicle_state):
         return {
             "road_id": cosim_vehicle_state["road_id"],
             "lane_id": cosim_vehicle_state["lane_id"],
             "s": cosim_vehicle_state["s"]
         }
+
+    def _spawn_side_for(self, hero_cosim_data, cosim_data) -> str:
+        """Which bubble boundary this vehicle entered through.
+
+        Used to refund the right flux memory if the insertion turns out to have
+        failed, so a rejected spawn exactly undoes the decrement that paid for it.
+        """
+        centre = hero_cosim_data["s"]
+        return "rear" if float(cosim_data["s"]) < centre else "front"
     
-    def getEligibleBlueprintsFromLengthAndWidth(self, cosim_vehicle_state):
+    def get_eligible_blueprints_from_length_and_width(self, cosim_vehicle_state):
         eligible_blueprints = []
         for blueprint_id in self.vehicle_blueprints_selection:
-            if (self.getBlueprintLength(blueprint_id) <= cosim_vehicle_state["length"]):
+            if (self.get_blueprint_length(blueprint_id) <= cosim_vehicle_state["length"]):
                 eligible_blueprints.append(blueprint_id)
         # If for some reason we get a bad length and width that doesn't comply with anything we have, we have to just use fake dimensions instead that are still reasonable.
         if (len(eligible_blueprints) == 0):
-            print(f"Falsifying the dimensions of {cosim_vehicle_state} so we can spawn it!")
+            #print(f"Falsifying the dimensions of {cosim_vehicle_state} so we can spawn it!")
             cosim_vehicle_state["length"] = 4.0
             cosim_vehicle_state["width"] = 2.5
-            return self.getEligibleBlueprintsFromLengthAndWidth(cosim_vehicle_state)
+            return self.get_eligible_blueprints_from_length_and_width(cosim_vehicle_state)
         return eligible_blueprints
     
-    def spawnVehicleFromCoSIM(self, cosim_vehicle_state, blueprint_id = None):
-        selected_blueprint_id = numpy.random.choice(self.getEligibleBlueprintsFromLengthAndWidth(cosim_vehicle_state)) if blueprint_id is None else blueprint_id
-        opendrive_location = self.offsetOpenDRIVELocationByBlueprint(self.generateOpenDRIVELocationFromState(cosim_vehicle_state), selected_blueprint_id)
-        spawn_waypoint = self.getSpawnWaypointForOpenDRIVELocation(opendrive_location).transform
+    def select_largest_blueprint(self, blueprints):
+        blueprints_sorted = sorted(blueprints, key=self.get_blueprint_length)
+        return blueprints_sorted[-1]
+    
+    def spawn_vehicle_from_co_sim(self, cosim_vehicle_state, blueprint_id=None, tick=False):
+        selected_blueprint_id = numpy.random.choice(self.get_eligible_blueprints_from_length_and_width(cosim_vehicle_state)) if blueprint_id is None else blueprint_id
+        #selected_blueprint_id = self.select_largest_blueprint(self.get_eligible_blueprints_from_length_and_width(cosim_vehicle_state)) if blueprint_id is None else blueprint_id
+        opendrive_location = self.offset_open_drive_location_by_blueprint(self.generate_open_drive_location_from_state(cosim_vehicle_state), selected_blueprint_id)
+        spawn_waypoint = self.get_spawn_waypoint_for_open_drive_location(opendrive_location).transform
         selected_blueprint = self.vehicle_blueprints[selected_blueprint_id]
         spawn_waypoint.location.z += self.spawn_z_offset
+        yaw = math.radians(spawn_waypoint.rotation.yaw)
+        cosim_vehicle_state["temporary_velocity_push"] = (cosim_vehicle_state["velocity"]*math.cos(yaw), cosim_vehicle_state["velocity"]*math.sin(yaw), 0.0)
         batch = []
         batch.append(carla.command.SpawnActor(selected_blueprint, spawn_waypoint)
-            .then(carla.command.SetAutopilot(carla.command.FutureActor, False, self.tm_port)))
+            .then(carla.command.ApplyTargetVelocity(carla.command.FutureActor, carla.Vector3D(*cosim_vehicle_state["temporary_velocity_push"]))))
         
-        for response in self.client.apply_batch_sync(batch, True):
+        actor_id = None
+        for response in self.client.apply_batch_sync(batch, tick):
             if response.error:
-                pass
+                print("Corresponding error: ", response.error)
             else:
-                return response.actor_id
-        return None
+                actor_id = response.actor_id
+                batch = []
+                batch.append(carla.command.SetAutopilot(actor_id, False, self.tm_port))
+                self.client.apply_batch_sync(batch, False)
+        return actor_id
     
     
-    def offsetOpenDRIVELocationByBlueprint(self, opendrive_location, blueprint_id):
+    def offset_open_drive_location_by_blueprint(self, opendrive_location, blueprint_id):
         return {
             "road_id": opendrive_location["road_id"],
             "lane_id": opendrive_location["lane_id"],
             "s": opendrive_location["s"] - self.vehicle_blueprints_bounds[blueprint_id]["xmin"]
         }
     
-    def offsetSByBlueprintForCoSIM(self, s, blueprint_id):
+    def offset_s_by_blueprint_for_co_sim(self, s, blueprint_id):
         return s + self.vehicle_blueprints_bounds[blueprint_id]["xmin"]
     
-    def getVehicleBoundingBox(self, vehicle_actor_id):
+    def get_vehicle_bounding_box(self, vehicle_actor_id):
         actor = self.world.get_actors([vehicle_actor_id])[0]
         return actor.bounding_box.get_local_vertices()
     
-    def despawnCARLAVehicle(self, vehicle_state):
+    def despawn_carla_vehicle(self, vehicle_state):
         self.client.apply_batch_sync([carla.command.DestroyActor(vehicle_state["carla_actor_id"])])
 
-    def pushVehicleImpulse(self, vehicle_state, speed):
+    def push_vehicle_impulse(self, vehicle_state, speed):
         vehicle_id = vehicle_state["carla_actor_id"]
         vehicle_actor = self.world.get_actors([vehicle_id])[0]
         actor_transform = vehicle_actor.get_transform()
@@ -462,9 +490,9 @@ class I24MotionCarlaSimulationCoupled:
         batch = []
         batch.append(carla.command.SetAutopilot(vehicle_id, True, self.tm_port))
         self.client.apply_batch_sync(batch, False)
-        print(f"At time {self.world.get_snapshot().timestamp} Pushed {vehicle_state} by {speed} with mass of {mass} and speed of {speed} and transform of {actor_transform}")
+        #print(f"At time {self.world.get_snapshot().timestamp} Pushed {vehicle_state} by {speed} with mass of {mass} and speed of {speed} and transform of {actor_transform}")
 
-    def pushVehicle(self, vehicle_state, speed):
+    def push_vehicle(self, vehicle_state, speed):
         vehicle_id = vehicle_state["carla_actor_id"]
         vehicle_actor = self.world.get_actors([vehicle_id])[0]
         actor_transform = vehicle_actor.get_transform()
@@ -480,70 +508,176 @@ class I24MotionCarlaSimulationCoupled:
             carla.Vector3D(x=speed, y=0.0, z=0.0)
         )
 
-        print(f"At time {self.world.get_snapshot().timestamp} Pushed {vehicle_state} by {speed} and transform of {actor_transform}")
+        #print(f"At time {self.world.get_snapshot().timestamp} Pushed {vehicle_state} by {speed} and transform of {actor_transform}")
     
-    def spawnHeroVehicle(self, blueprint_id=None):
-        cosim_data = self.coupler.getHeroData()
-        actor_id = self.spawnVehicleFromCoSIM(cosim_data, blueprint_id)
-        print("hero", cosim_data["id"])
+    def spawn_hero_vehicle(self, blueprint_id=None):
+        cosim_data = self.coupler.get_hero_data()
+        actor_id = self.spawn_vehicle_from_co_sim(cosim_data, blueprint_id, True)
+        #print("hero", cosim_data["id"])
         if actor_id is None:
-            print("Failed to spawn hero!")
-            print(cosim_data)
+            #print("Failed to spawn hero!")
+            #print(cosim_data)
             return
         new_hero_state = {
             "carla_actor_id": actor_id,
             "cosim_data": cosim_data,
-            "just_spawned": True,
+            "just_spawned_cooldown": 1,
+            "autopilot_enabled": False,
             "pushed": False
         }
+        # Create topdown BEV view
+        video_name = self.carla_video_output_prefix + "_bev.mp4"
+        FPS = self.FPS
+        HEIGHT = 100.0
+        IMG_W, IMG_H, FOV = self.configure_topdown_camera(0.1, 400.0, 40.0, HEIGHT)
+        print(IMG_W, IMG_H, FOV, HEIGHT)
+        #IMG_W, IMG_H = 1024, 1024
+        #FOV = 45.0
+        #HEIGHT = 100.0
+        bp_lib = self.world.get_blueprint_library()
+        cam_bp = bp_lib.find('sensor.camera.rgb')  # or sensor.camera.rgb
+        cam_bp.set_attribute('image_size_x', str(IMG_W))
+        cam_bp.set_attribute('image_size_y', str(IMG_H))
+        cam_bp.set_attribute('fov', str(FOV))
+        cam_bp.set_attribute('sensor_tick', str(1.0/FPS))
+        cam_transform = carla.Transform(
+            carla.Location(x=0.0, z=HEIGHT),
+            carla.Rotation(pitch=-90.0, yaw=0.0, roll=0.0),
+        )
+        actor_list = self.world.get_actors()
+        vehicle = actor_list.find(actor_id)
+
+        camera = self.world.spawn_actor(
+            cam_bp, cam_transform, attach_to=vehicle,
+            attachment_type=carla.AttachmentType.Rigid,
+        )
+        
+        if self.record_videos:
+            self.hero_cameras[video_name] = camera
+            self.hero_camera_queues[video_name] = queue.Queue()
+            camera.listen(self.hero_camera_queues[video_name].put)
+            self.hero_camera_writers[video_name] = imageio.get_writer(
+                video_name, fps=FPS, codec="libx264", quality=8,
+                macro_block_size=1,                      # don't auto-resize odd dimensions
+                ffmpeg_params=["-pix_fmt", "yuv420p"],   # compatibility across players
+            )
+
+            # Create front-facing rear-based camera view
+            video_name = self.carla_video_output_prefix + "_front_view.mp4"
+            FPS = self.FPS
+            IMG_W, IMG_H, FOV =  2560, 1440, 90
+            bp_lib = self.world.get_blueprint_library()
+            cam_bp = bp_lib.find('sensor.camera.rgb')  # or sensor.camera.rgb
+            cam_bp.set_attribute('image_size_x', str(IMG_W))
+            cam_bp.set_attribute('image_size_y', str(IMG_H))
+            cam_bp.set_attribute('fov', str(FOV))
+            cam_bp.set_attribute('sensor_tick', str(1.0/FPS))
+            cam_transform = carla.Transform(
+                carla.Location(x=-12.0, z=5.0),
+                carla.Rotation(pitch=0.0, yaw=0.0, roll=0.0),
+            )
+            actor_list = self.world.get_actors()
+            vehicle = actor_list.find(actor_id)
+
+            camera = self.world.spawn_actor(
+                cam_bp, cam_transform, attach_to=vehicle,
+                attachment_type=carla.AttachmentType.Rigid,
+            )
+            
+            self.hero_cameras[video_name] = camera
+            self.hero_camera_queues[video_name] = queue.Queue()
+            camera.listen(self.hero_camera_queues[video_name].put)
+            self.hero_camera_writers[video_name] = imageio.get_writer(
+                video_name, fps=FPS, codec="libx264", quality=8,
+                macro_block_size=1,                      # don't auto-resize odd dimensions
+                ffmpeg_params=["-pix_fmt", "yuv420p"],   # compatibility across players
+            )
+
+            # Create rear-facing front-based camera view
+            video_name = self.carla_video_output_prefix + "_rear_view.mp4"
+            FPS = self.FPS
+            IMG_W, IMG_H, FOV =  2560, 1440, 90
+            bp_lib = self.world.get_blueprint_library()
+            cam_bp = bp_lib.find('sensor.camera.rgb')  # or sensor.camera.rgb
+            cam_bp.set_attribute('image_size_x', str(IMG_W))
+            cam_bp.set_attribute('image_size_y', str(IMG_H))
+            cam_bp.set_attribute('fov', str(FOV))
+            cam_bp.set_attribute('sensor_tick', str(1.0/FPS))
+            cam_transform = carla.Transform(
+                carla.Location(x=12.0, z=5.0),
+                carla.Rotation(pitch=0.0, yaw=180.0, roll=0.0),
+            )
+            actor_list = self.world.get_actors()
+            vehicle = actor_list.find(actor_id)
+
+            camera = self.world.spawn_actor(
+                cam_bp, cam_transform, attach_to=vehicle,
+                attachment_type=carla.AttachmentType.Rigid,
+            )
+            
+            self.hero_cameras[video_name] = camera
+            self.hero_camera_queues[video_name] = queue.Queue()
+            camera.listen(self.hero_camera_queues[video_name].put)
+            self.hero_camera_writers[video_name] = imageio.get_writer(
+                video_name, fps=FPS, codec="libx264", quality=8,
+                macro_block_size=1,                      # don't auto-resize odd dimensions
+                ffmpeg_params=["-pix_fmt", "yuv420p"],   # compatibility across players
+            )
+
         self.hero_state = new_hero_state
+
         #self.pushVehicle(new_hero_state, cosim_data["velocity"])
 
-    def spawnVisibleVehicle(self, cosim_data, blueprint_id=None):
-        actor_id = self.spawnVehicleFromCoSIM(cosim_data, blueprint_id)
-        print("visible", cosim_data["id"])
+    def spawn_visible_vehicle(self, cosim_data, blueprint_id=None):
+        actor_id = self.spawn_vehicle_from_co_sim(cosim_data, blueprint_id)
+        #print("visible", cosim_data["id"])
         if actor_id is None:
             print("Failed to spawn visible!")
             print(cosim_data)
+            self.coupler.credit_lost_vehicle(int(cosim_data["lane_id"]), self._spawn_side_for(self.coupler.get_hero_data(), cosim_data))
             return
         new_visible_state = {
             "carla_actor_id": actor_id,
             "cosim_data": cosim_data,
-            "just_spawned": True,
-            "pushed": False
+            "just_spawned_cooldown": 1,
+            "autopilot_enabled": False,
+            "pushed": False,
         }
         self.visible_states[cosim_data["id"]] = new_visible_state
         #self.pushVehicle(new_visible_state, cosim_data["velocity"])
 
-    def despawnHeroVehicle(self):
-        self.despawnCARLAVehicle(self.hero_state)
+    def despawn_hero_vehicle(self):
+        self.despawn_carla_vehicle(self.hero_state)
         self.hero_state = None
 
-    def despawnVisibleVehicle(self, visible_state):
-        self.despawnCARLAVehicle(visible_state)
+    def despawn_visible_vehicle(self, visible_state):
+        self.despawn_carla_vehicle(visible_state)
         self.visible_states.pop(visible_state["cosim_data"]["id"], None)
     
-    def resetVisibleStates(self):
+    def reset_visible_states(self):
         self.visible_states = {}
 
-    def getBlueprintLength(self, blueprint_id):
+    def get_blueprint_length(self, blueprint_id):
         return self.vehicle_blueprints_bounds[blueprint_id]["xmax"] - self.vehicle_blueprints_bounds[blueprint_id]["xmin"]
     
-    def getBlueprintWidth(self, blueprint_id):
+    def get_blueprint_width(self, blueprint_id):
         return self.vehicle_blueprints_bounds[blueprint_id]["ymax"] - self.vehicle_blueprints_bounds[blueprint_id]["ymin"]
 
-    def getVehicleLength(self, vehicle_state):
+    def get_vehicle_length(self, vehicle_state):
         vehicle_actor = self.world.get_actors([vehicle_state["carla_actor_id"]])[0]
         blueprint_id = vehicle_actor.type_id
-        return self.getBlueprintLength(blueprint_id)
+        return self.get_blueprint_length(blueprint_id)
     
-    def getVehicleWidth(self, vehicle_state):
+    def get_vehicle_width(self, vehicle_state):
         vehicle_actor = self.world.get_actors([vehicle_state["carla_actor_id"]])[0]
         blueprint_id = vehicle_actor.type_id
-        return self.getBlueprintWidth(blueprint_id)
+        return self.get_blueprint_width(blueprint_id)
 
-    def rebuildCoSIMVehicleState(self, vehicle_state):
-        vehicle_actor = self.world.get_actors([vehicle_state["carla_actor_id"]])[0]
+    def rebuild_co_sim_vehicle_state(self, vehicle_state):
+        vehicle_actors = self.world.get_actors([vehicle_state["carla_actor_id"]])
+        if (len(vehicle_actors) == 0):
+            return None
+        vehicle_actor = vehicle_actors[0]
         location = vehicle_actor.get_location()
         closest_waypoint = self.carla_map.get_waypoint(location, project_to_road=True)
         vehicle_road_id = closest_waypoint.road_id
@@ -551,94 +685,148 @@ class I24MotionCarlaSimulationCoupled:
         return {
             "id": vehicle_state["cosim_data"]["id"],
             "class": vehicle_state["cosim_data"]["class"],
-            "length": self.getVehicleLength(vehicle_state),
-            "width": self.getVehicleWidth(vehicle_state),
+            "length": self.get_vehicle_length(vehicle_state),
+            "width": self.get_vehicle_width(vehicle_state),
             "time": vehicle_state["cosim_data"]["time"],
-            "s": self.offsetSByBlueprintForCoSIM(closest_waypoint.s, vehicle_actor.type_id),
+            "s": self.offset_s_by_blueprint_for_co_sim(closest_waypoint.s, vehicle_actor.type_id),
             "t": (vehicle_lane_id * 3.5) + 1.75, # Hack kludge to estimate
-            "velocity": vehicle_actor.get_velocity().length(),
+            "velocity": float(vehicle_actor.get_velocity().length()),
             "lane_id": vehicle_lane_id,
             "road_id": vehicle_road_id
         }
-    def rebuildCoSIMHeroState(self):
-        return self.rebuildCoSIMVehicleState(self.hero_state)
+    def rebuild_co_sim_hero_state(self):
+        return self.rebuild_co_sim_vehicle_state(self.hero_state)
 
-    def rebuildCoSIMVisibleState(self):
+    def rebuild_co_sim_visible_state(self, hero_rebuilt=None, visible_rebuilt=None):
         cosim_visible_states = {}
         road_str = str(self.coupler.hero_road)
         for lane_count in range(1, self.mapping[road_str]["lanes"] + 1):
             lane_id = lane_count * -1
             cosim_visible_states[lane_id] = {}
         for cosim_id in self.visible_states:
-            rebuilt_state = self.rebuildCoSIMVehicleState(self.visible_states[cosim_id])
-            cosim_visible_states[rebuilt_state["lane_id"]][rebuilt_state["id"]] = rebuilt_state
+            rebuilt_state = self.rebuild_co_sim_vehicle_state(self.visible_states[cosim_id])
+            if (rebuilt_state is not None):
+                cosim_visible_states[rebuilt_state["lane_id"]][rebuilt_state["id"]] = rebuilt_state
+        if (visible_rebuilt is not None):
+            for lane in visible_rebuilt:
+                for cosim_id in visible_rebuilt[lane]:
+                    in_rebuilt = False
+                    for lane2 in cosim_visible_states:
+                        for cosim_id_rebuilt in cosim_visible_states[lane2]:
+                            in_rebuilt = in_rebuilt or (cosim_id_rebuilt == cosim_id)
+                    if (not in_rebuilt):
+                        self.coupler.credit_lost_vehicle(int(visible_rebuilt[lane][cosim_id]["lane_id"]), self._spawn_side_for(hero_rebuilt, visible_rebuilt[lane][cosim_id]))
+                        self.visible_states.pop(cosim_id)
+
         return cosim_visible_states
 
-    def spawnAndDespawnVisibleVehiclesFromCoSIM(self):
-        cosim_visible_vehicles = self.coupler.getVisibleData()
-        self.resetVisibleStates()
+    def spawn_and_despawn_visible_vehicles_from_co_sim(self):
+        cosim_visible_vehicles = self.coupler.get_visible_data()
+        self.reset_visible_states()
         for lane in cosim_visible_vehicles:
             for id in cosim_visible_vehicles[lane]:
-                self.spawnVisibleVehicle(cosim_visible_vehicles[lane][id])
+                self.spawn_visible_vehicle(cosim_visible_vehicles[lane][id])
 
-    def updateVisibleVehiclesFromCoSIM(self):
-        cosim_visible_vehicles = self.coupler.getVisibleData()
-        cosim_visible_vehicles_ids = self.coupler.getVisibleIdsFlat()
+    def update_visible_vehicles_from_co_sim(self):
+        current_visible_state_ids = list(self.visible_states.keys())
+        cosim_visible_vehicles = self.coupler.get_visible_data()
+        cosim_visible_vehicles_ids = self.coupler.get_visible_ids_flat()
+        for id in current_visible_state_ids:
+            if id not in cosim_visible_vehicles_ids:
+                self.despawn_visible_vehicle(self.visible_states[id])
         for lane in cosim_visible_vehicles:
             for id in cosim_visible_vehicles[lane]:
                 if id not in self.visible_states: #New vehicle!
-                    self.spawnVisibleVehicle(cosim_visible_vehicles[lane][id])
-        current_visible_state_ids = list(self.visible_states.keys())
-        for id in current_visible_state_ids:
-            if id not in cosim_visible_vehicles_ids:
-                self.despawnVisibleVehicle(self.visible_states[id])
+                    self.spawn_visible_vehicle(cosim_visible_vehicles[lane][id])
 
-    def updateHeroAndVisibleVehiclesFromTM(self):
+    def get_carla_actor_id(self, cosim_id):
+        if (cosim_id in self.visible_states):
+            return self.visible_states[cosim_id]["carla_actor_id"]
+        elif (self.hero_state["cosim_data"]["id"] == cosim_id):
+            return self.hero_state["carla_actor_id"]
+        return None
+    
+    def get_internal_vehicle_state(self, cosim_id):
+        if (cosim_id in self.visible_states):
+            return self.visible_states[cosim_id]
+        elif (self.hero_state["cosim_data"]["id"] == cosim_id):
+            return self.hero_state
+        return None
+
+    def update_hero_and_visible_vehicles_from_tm(self, hero_rebuilt, visible_rebuilt):
         vehicle_actor = self.world.get_actors([self.hero_state["carla_actor_id"]])[0]
         self.tm.set_desired_speed(vehicle_actor, self.hero_vehicle_speed)
         #self.tm.set_desired_speed(vehicle_actor, 70.0)
         cosim_lead_vehicles = {}
         cosim_nominal_vehicle_actor_ids = []
+        cosim_tm_controlled_vehicles = []
+        cosim_pushed_vehicles = []
         road_str = str(self.coupler.hero_road)
-        min_s, max_s = self.coupler.getCurrentVisibleWindow()[2:]
+        min_s, max_s = hero_rebuilt["s"] - self.coupler.visible_window, hero_rebuilt["s"] + self.coupler.visible_window
         middle_s = (max_s + min_s) / 2.0
+        lead_vehicle_region_start = max_s - self.coupler.transition_region_size
         for lane_count in range(1, self.mapping[road_str]["lanes"] + 1):
             lane_id = lane_count * -1
-            potential_cosim_vehicles = [self.visible_states[cosim_id] for cosim_id in self.visible_states if self.visible_states[cosim_id]["cosim_data"]["lane_id"] == lane_id]
-            potential_cosim_vehicles_sorted = sorted(potential_cosim_vehicles, key=lambda entry: entry["cosim_data"]["s"], reverse=True)
-            cosim_lead_vehicles[lane_id] = None
+            #potential_cosim_vehicles = [self.visible_states[cosim_id] for cosim_id in self.visible_states if self.visible_states[cosim_id]["cosim_data"]["lane_id"] == lane_id]
+            potential_cosim_vehicles = [visible_rebuilt[lane_id][cosim_id] for cosim_id in visible_rebuilt[lane_id]]
+            potential_cosim_vehicles.append(hero_rebuilt)
+            potential_cosim_vehicles_sorted = sorted(potential_cosim_vehicles, key=lambda entry: entry["s"], reverse=True)
+            cosim_lead_vehicles[lane_id] = []
             for entry in potential_cosim_vehicles_sorted:
-                if (entry["carla_actor_id"] != self.hero_state["carla_actor_id"]) \
-                and (entry["cosim_data"]["s"] <= max_s) \
-                and (entry["cosim_data"]["s"] > middle_s):
-                    if (cosim_lead_vehicles[lane_id] is None) or (cosim_lead_vehicles[lane_id]["cosim_data"]["s"] < entry["cosim_data"]["s"]):
-                        cosim_lead_vehicles[lane_id] = entry
+                if (entry["id"] != hero_rebuilt["id"]) \
+                and (entry["s"] > lead_vehicle_region_start):
+                    if (len(cosim_lead_vehicles[lane_id]) == 0):
+                        cosim_lead_vehicles[lane_id].append(entry)
+                    elif (cosim_lead_vehicles[lane_id][0]["s"] < entry["s"]):
+                        cosim_lead_vehicles[lane_id][0] = entry
+                if (self.get_internal_vehicle_state(entry["id"])["just_spawned_cooldown"] == 0):
+                    cosim_tm_controlled_vehicles.append([entry, self.get_carla_actor_id(entry["id"])])
+                else:
+                    cosim_pushed_vehicles.append([entry, self.get_carla_actor_id(entry["id"])])
             for entry in potential_cosim_vehicles_sorted:
-                if (cosim_lead_vehicles[lane_id] is None) or (entry["carla_actor_id"] != cosim_lead_vehicles[lane_id]["carla_actor_id"]):
-                    cosim_nominal_vehicle_actor_ids.append(entry["carla_actor_id"])
+                if (self.get_carla_actor_id(entry["id"]) not in [self.get_carla_actor_id(cosim_lead_vehicle["id"]) for cosim_lead_vehicle in cosim_lead_vehicles[lane_id]]):
+                    cosim_nominal_vehicle_actor_ids.append(self.get_carla_actor_id(entry["id"]))
+
+        for entry, actor_id in cosim_tm_controlled_vehicles:
+            self.world.get_actors([actor_id])[0].disable_constant_velocity()
+        batch = []
+        for entry, actor_id in cosim_tm_controlled_vehicles:
+            entry_internal = self.get_internal_vehicle_state(entry["id"])
+            if (not entry_internal["autopilot_enabled"]):
+                batch.append(carla.command.SetAutopilot(actor_id, True, self.tm_port))
+                entry_internal["autopilot_enabled"] = True
+        self.client.apply_batch_sync(batch, False)
+        for entry, actor_id in cosim_tm_controlled_vehicles:
+            entry_internal = self.get_internal_vehicle_state(entry["id"])
+            if (entry_internal["autopilot_enabled"]):
+                self.tm.auto_lane_change(self.world.get_actors([actor_id])[0], True)
+        batch = []
+        for entry, actor_id in cosim_pushed_vehicles:
+            batch.append(carla.command.ApplyTargetVelocity(actor_id, carla.Vector3D(*self.get_internal_vehicle_state(entry["id"])["cosim_data"]["temporary_velocity_push"])))
+        self.client.apply_batch_sync(batch, False)
 
         for actor_id in cosim_nominal_vehicle_actor_ids:
             cosim_actor = self.world.get_actors([actor_id])[0]
             self.tm.set_desired_speed(cosim_actor, self.hero_vehicle_speed)
         for lane_count in range(1, self.mapping[road_str]["lanes"] + 1):
             lane_id = lane_count * -1
-            cosim_lane_lead_vehicle = cosim_lead_vehicles[lane_id]
-            cosim_ghost_lead_state = self.coupler.getLowestAheadGhostVehicle(lane_id)
-            cosim_ghost_lead_velocity = cosim_ghost_lead_state["velocity"] * self.mps_to_kph if cosim_ghost_lead_state is not None else self.coupler.getAheadLaneVelocity(lane_id, self.hero_vehicle_speed)
-            if cosim_lane_lead_vehicle is not None:
-                cosim_actor = self.world.get_actors([cosim_lane_lead_vehicle["carla_actor_id"]])[0]
+            cosim_lane_lead_vehicles = cosim_lead_vehicles[lane_id]
+            cosim_ghost_lead_state = self.coupler.get_lowest_ahead_ghost_vehicle(lane_id)
+            cosim_ghost_lead_velocity = cosim_ghost_lead_state["velocity"] * self.mps_to_kph if cosim_ghost_lead_state is not None else self.coupler.get_ahead_lane_velocity_macro(lane_id, self.hero_vehicle_speed / self.mps_to_kph) * self.mps_to_kph
+            for cosim_lane_lead_vehicle in cosim_lane_lead_vehicles:
+                cosim_actor = self.world.get_actors([self.get_carla_actor_id(cosim_lane_lead_vehicle["id"])])[0]
                 self.tm.set_desired_speed(cosim_actor, cosim_ghost_lead_velocity)
 
-    def updateCoSIM(self):
-        hero_rebuilt = self.rebuildCoSIMHeroState()
-        visible_rebuilt = self.rebuildCoSIMVisibleState()
+    def update_co_sim(self, hero_rebuilt_prev = None, visible_rebuilt_prev = None):
+        hero_rebuilt = self.rebuild_co_sim_hero_state()
+        visible_rebuilt = self.rebuild_co_sim_visible_state(hero_rebuilt_prev, visible_rebuilt_prev)
         return (hero_rebuilt, visible_rebuilt)
 
-    def updateCoSIMSnapshotData(self):
+    def update_co_sim_snapshot_data(self):
         vehicles = []
-        hero_state = self.coupler.getHeroData()
-        visible_state = self.coupler.getVisibleData()
-        ghost_state = self.coupler.getGhostData()
+        hero_state = self.coupler.get_hero_data()
+        visible_state = self.coupler.get_visible_data()
+        ghost_state = self.coupler.get_ghost_data()
         bounds = compute_world_bounds(self.coupler)
         vehicles.append(hero_state)
         for lane in visible_state:
@@ -652,8 +840,8 @@ class I24MotionCarlaSimulationCoupled:
         self.cosim_snapshot.append(vehicles)
         self.cosim_bounds.append(bounds)
 
-    def fetchData(self):
-        self.updateCoSIMSnapshotData()
+    def fetch_data(self):
+        self.update_co_sim_snapshot_data()
         all_cars = [self.hero_state["carla_actor_id"]]
         for cosim_id in self.visible_states:
             all_cars.append(self.visible_states[cosim_id]["carla_actor_id"])
@@ -671,7 +859,7 @@ class I24MotionCarlaSimulationCoupled:
             location = vehicle.get_location()
             closest_waypoint = self.carla_map.get_waypoint(location, project_to_road=True)
             if (location.distance(closest_waypoint.transform.location) > 3.0):
-                print("skipping!")
+                #print("skipping!")
                 continue
             vehicle_id = vehicle.id
             road_id = closest_waypoint.road_id
@@ -689,7 +877,7 @@ class I24MotionCarlaSimulationCoupled:
                 hero_status.append(1)
             else:
                 hero_status.append(0)
-        print("Velocities ", numpy.mean(velocities), self.current_timestamp)
+        #print("Velocities ", numpy.mean(velocities), self.current_timestamp)
         #print("SPEED LIMIT ", numpy.min(speed_limit_current), numpy.mean(speed_limit_current), numpy.max(speed_limit_current), numpy.std(speed_limit_current))
         concat_df = pandas.DataFrame({
             "simulation_time": simulation_time,
@@ -704,51 +892,75 @@ class I24MotionCarlaSimulationCoupled:
         #print(f"Recording {len(concat_df)} records!")
         self.trajectory_data = pandas.concat([self.trajectory_data, concat_df])
 
-    def markHeroesAndVisiblesInPreviousStepAsSpawned(self):
-        self.hero_state["just_spawned"] = False
+    def mark_heroes_and_visibles_in_previous_step_as_spawned(self):
+        self.hero_state["just_spawned_cooldown"] = self.hero_state["just_spawned_cooldown"] - 1 if self.hero_state["just_spawned_cooldown"] > 0 else 0
         for cosim_id in self.visible_states:
-            self.visible_states[cosim_id]["just_spawned"] = False
+            self.visible_states[cosim_id]["just_spawned_cooldown"] = self.visible_states[cosim_id]["just_spawned_cooldown"] - 1 if self.visible_states[cosim_id]["just_spawned_cooldown"] > 0 else 0
 
-    def pushEligibleVehicles(self):
-        if (not self.hero_state["just_spawned"]) and (not self.hero_state["pushed"]):
-            self.pushVehicle(self.hero_state, self.hero_state["cosim_data"]["velocity"])
+    def push_eligible_vehicles(self):
+        if (self.hero_state["just_spawned_cooldown"] == 0) and (not self.hero_state["pushed"]):
+            self.push_vehicle(self.hero_state, self.hero_state["cosim_data"]["velocity"])
             self.hero_state["pushed"] = True
             self.tm.auto_lane_change(self.world.get_actors([self.hero_state["carla_actor_id"]])[0], False)
         for cosim_id in self.visible_states:
-            if (not self.visible_states[cosim_id]["just_spawned"]) and (not self.visible_states[cosim_id]["pushed"]):
-                self.pushVehicle(self.visible_states[cosim_id], self.visible_states[cosim_id]["cosim_data"]["velocity"])
+            if (self.visible_states[cosim_id]["just_spawned_cooldown"] == 0) and (not self.visible_states[cosim_id]["pushed"]):
+                self.push_vehicle(self.visible_states[cosim_id], self.visible_states[cosim_id]["cosim_data"]["velocity"])
                 self.visible_states[cosim_id]["pushed"] = True
 
-    def initializeSimulation(self):
-        # Find all actors and filter for those starting with 'vehicle.'
+    def initialize_simulation(self):
         vehicle_list = self.world.get_actors().filter('vehicle.*')
+        self.client.apply_batch_sync([carla.command.DestroyActor(x.id) for x in vehicle_list], True)
 
-        # Destroy all found vehicles using a batch command for efficiency
-        self.client.apply_batch([carla.command.DestroyActor(x.id) for x in vehicle_list])
+        camera_list = self.world.get_actors().filter('sensor.camera.*')
+        self.client.apply_batch_sync([carla.command.DestroyActor(x.id) for x in camera_list], True)
         
-        print(f'Successfully destroyed {len(vehicle_list)} vehicles.')
-        self.spawnHeroVehicle("vehicle.audi.a2") # Lets keep us at it an audi for now ;)!
-        self.spawnAndDespawnVisibleVehiclesFromCoSIM()
+        #print(f'Successfully destroyed {len(vehicle_list)} vehicles.')
+        self.spawn_hero_vehicle("vehicle.audi.a2") # Lets keep us at it an audi for now ;)!
+        self.spawn_and_despawn_visible_vehicles_from_co_sim()
 
-    def runSimulationOver(self, t=1.0):
+    def configure_topdown_camera(self, mpp, cover_fwd_back, cover_lateral, height):
+        img_w = round(cover_lateral  / mpp)   # horizontal extent
+        img_h = round(cover_fwd_back / mpp)   # vertical extent (front + behind)
+        fov   = math.degrees(2 * math.atan(img_w * mpp / (2 * height)))
+        return img_w, img_h, fov
+
+    def carla_to_bgr(self, image):
+        """carla.Image (BGRA) -> H x W x 3 uint8 BGR array for OpenCV."""
+        arr = numpy.frombuffer(image.raw_data, dtype=numpy.uint8)
+        arr = arr.reshape((image.height, image.width, 4))
+        return arr[:, :, :3]
+    
+    def carla_to_rgb(self, image):
+        """carla.Image (BGRA) -> H x W x 3 uint8 BGR array for OpenCV."""
+        arr = numpy.frombuffer(image.raw_data, dtype=numpy.uint8)
+        arr = arr.reshape((image.height, image.width, 4))
+        arr = arr[:, :, :3]
+        arr = arr[:, :, ::-1]
+        return arr
+    
+    def run_simulation_over(self, t=1.0, eps=1e-2):
         starting_timestamp = self.current_timestamp
-        hero_rebuilt, visible_rebuilt = self.updateCoSIM()
-        while (self.current_timestamp < (starting_timestamp + t)):
-            self.updateHeroAndVisibleVehiclesFromTM()
+        hero_rebuilt, visible_rebuilt = self.update_co_sim()
+        while (self.current_timestamp < (starting_timestamp + t - eps)):
+            self.update_hero_and_visible_vehicles_from_tm(hero_rebuilt, visible_rebuilt)
             self.world.tick()
-            self.fetchData()
-            self.markHeroesAndVisiblesInPreviousStepAsSpawned()
-            self.pushEligibleVehicles()
-            hero_rebuilt, visible_rebuilt = self.updateCoSIM()
+            for video_name, video_queue in self.hero_camera_queues.items():
+                if (not video_queue.empty()):
+                    new_hero_image = video_queue.get()
+                    self.hero_camera_writers[video_name].append_data(self.carla_to_rgb(new_hero_image))
+            self.fetch_data()
+            self.mark_heroes_and_visibles_in_previous_step_as_spawned()
+            self.push_eligible_vehicles()
+            hero_rebuilt, visible_rebuilt = self.update_co_sim(hero_rebuilt, visible_rebuilt)
             self.current_timestamp += self.tick_step
         print(self.current_timestamp)
         #print(hero_rebuilt, visible_rebuilt)
         return hero_rebuilt, visible_rebuilt
     
-    def updateSimulation(self):
-        self.updateVisibleVehiclesFromCoSIM()
+    def update_simulation(self):
+        self.update_visible_vehicles_from_co_sim()
 
-    def destroySimulation(self):
+    def destroy_simulation(self):
         try:
             settings = self.world.get_settings()
             settings.synchronous_mode = False
@@ -760,12 +972,10 @@ class I24MotionCarlaSimulationCoupled:
             for cosim_id in self.visible_states:
                 all_cars.append(self.visible_states[cosim_id]["carla_actor_id"])
             self.client.apply_batch([carla.command.DestroyActor(x) for x in all_cars])
-            print(f"Despawned {len(all_cars)} cars!")
+            #print(f"Despawned {len(all_cars)} cars!")
+
+            for video_name, writer in self.hero_camera_writers.items():
+                writer.close()
+                self.hero_cameras[video_name].stop()
         except:
             pass
-
-        #print(f"Saving {len(self.trajectory_data)} records to CSV at {self.trajectory_output_path}!")
-        #self.trajectory_data.to_csv(self.trajectory_output_path, index=False, header=True)
-
-        #print(f"Saving BEV video at {self.bev_video_output_path}")
-        #make_video_from_snapshots(self.coupler, self.cosim_snapshot, self.cosim_bounds, fps=int(1.0 / self.tick_step), out_path=self.bev_video_output_path)

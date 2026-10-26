@@ -4,7 +4,7 @@ import matplotlib as mpl
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 
-def plotTimeDiagramFromI24Data(csv_path, start_timestamp, road, selected_lane, road_name, figure_path):
+def plot_time_diagram_from_i24_data(csv_path, start_timestamp, road, selected_lane, road_name, figure_path):
     mpl.rcParams['font.size'] = 24
     sim_data = pandas.read_csv(csv_path)
     total_timestep = float(sim_data["simulation_time"].max())
@@ -12,7 +12,7 @@ def plotTimeDiagramFromI24Data(csv_path, start_timestamp, road, selected_lane, r
     max_s = float(sim_data[sim_data["hero_status"] == 1]["s"].max())
     source_data = i24_motion_data.I24MotionData(road, 1669812000.0 , 1669812600, -1600, 1600)
     print(start_timestamp, start_timestamp+total_timestep, min_s, max_s)
-    edie_box_sample = source_data.queryEdieBoxSubset(start_timestamp, start_timestamp+total_timestep, min_s, max_s)
+    edie_box_sample = source_data.query_edie_box_subset(start_timestamp, start_timestamp+total_timestep, min_s, max_s)
     sim_data_filtered = sim_data[(sim_data["road_id"] == road)]
     if selected_lane is not None:
         sim_data_filtered = sim_data[(sim_data["lane_id"] == selected_lane)]
@@ -40,5 +40,5 @@ def plotTimeDiagramFromI24Data(csv_path, start_timestamp, road, selected_lane, r
     ax.set_ylabel("Longitudinal Road Position (m)", fontsize=32)
     fig.savefig(figure_path)
 
-plotTimeDiagramFromI24Data("result_new_road_1_lane_2.csv", 1669812350, 1, None, "Eastbound", "eastbound_timespace.png")
-plotTimeDiagramFromI24Data("result_new_road_2_lane_1.csv", 1669812350, 2, None, "Westbound", "westbound_timespace.png")
+plot_time_diagram_from_i24_data("result_new_road_1_lane_2.csv", 1669812350, 1, None, "Eastbound", "eastbound_timespace.png")
+plot_time_diagram_from_i24_data("result_new_road_2_lane_1.csv", 1669812350, 2, None, "Westbound", "westbound_timespace.png")

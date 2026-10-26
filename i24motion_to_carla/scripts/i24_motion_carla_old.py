@@ -27,7 +27,7 @@ class I24MotionCarlaSimulation:
         self.road_cells = {}
         self.cars = []
         self.tm = None
-        self.connectToHost()
+        self.connect_to_host()
         with open(density_data_path, "r") as f:
             self.density_data = json.load(f)
         with open(mapping_path, "r") as f:
@@ -48,13 +48,13 @@ class I24MotionCarlaSimulation:
             }
         )
 
-    def discreteSampler(self, n):
+    def discrete_sampler(self, n):
         return numpy.random.poisson(lam=n)
     
-    def discreteSamplerRandom(self, n):
+    def discrete_sampler_random(self, n):
         return numpy.random.poisson(lam=n)
 
-    def connectToHost(self):
+    def connect_to_host(self):
         self.client = carla.Client(self.host, self.port)
         self.client.set_timeout(10.0)
         self.world = self.client.get_world()
@@ -72,10 +72,10 @@ class I24MotionCarlaSimulation:
         self.world.tick()
 
 
-    def launchSimulation(self):
-        self.generateRoadCellMetadata()
+    def launch_simulation(self):
+        self.generate_road_cell_metadata()
         try:
-            self.seedSimulation()
+            self.seed_simulation()
             while (self.current_time < self.episode_length):
                 self.tick()
                 #print(self.current_time)
@@ -107,32 +107,32 @@ class I24MotionCarlaSimulation:
     def tick(self):
         self.world.tick()
         self.current_time += self.tick_step
-        self.fetchData()
-        self.updateDensityDataFromReal()
-        self.updateVehicles()
+        self.fetch_data()
+        self.update_density_data_from_real()
+        self.update_vehicles()
 
-    def updateDensityDataFromReal(self):
-        if self.calculateCurrentDensityTime() > self.current_density_time:
+    def update_density_data_from_real(self):
+        if self.calculate_current_density_time() > self.current_density_time:
             # Update inflows and outflows!
-            self.current_density_time = self.calculateCurrentDensityTime()
+            self.current_density_time = self.calculate_current_density_time()
             # Ingoing ghost cells
             for road in self.road_cells:
                 for lane_id in self.road_cells[road]["inflow_ghost_cell"]:
                     cell_metadata = self.road_cells[road]["inflow_ghost_cell"][lane_id]
-                    cell_i24_data = self.getCurrentDensityInformation(cell_metadata["density_marker"], cell_metadata["density_road_id"], lane_id)
-                    cell_metadata["cumulative_inflow_real"] += self.discreteSampler(cell_i24_data["inflow"])#cell_i24_data["inflow"]#
-                    cell_metadata["cumulative_outflow_real"] += self.discreteSampler(cell_i24_data["outflow"])#cell_i24_data["outflow"]#
+                    cell_i24_data = self.get_current_density_information(cell_metadata["density_marker"], cell_metadata["density_road_id"], lane_id)
+                    cell_metadata["cumulative_inflow_real"] += self.discrete_sampler(cell_i24_data["inflow"])#cell_i24_data["inflow"]#
+                    cell_metadata["cumulative_outflow_real"] += self.discrete_sampler(cell_i24_data["outflow"])#cell_i24_data["outflow"]#
 
             # Outgoing ghost cells
             for road in self.road_cells:
                 for lane_id in self.road_cells[road]["outflow_ghost_cell"]:
                     cell_metadata = self.road_cells[road]["outflow_ghost_cell"][lane_id]
-                    cell_i24_data = self.getCurrentDensityInformation(cell_metadata["density_marker"], cell_metadata["density_road_id"], lane_id)
-                    cell_metadata["cumulative_inflow_real"] += self.discreteSampler(cell_i24_data["inflow"])#cell_i24_data["inflow"]#
-                    cell_metadata["cumulative_outflow_real"] += self.discreteSampler(cell_i24_data["outflow"])#cell_i24_data["outflow"]#
+                    cell_i24_data = self.get_current_density_information(cell_metadata["density_marker"], cell_metadata["density_road_id"], lane_id)
+                    cell_metadata["cumulative_inflow_real"] += self.discrete_sampler(cell_i24_data["inflow"])#cell_i24_data["inflow"]#
+                    cell_metadata["cumulative_outflow_real"] += self.discrete_sampler(cell_i24_data["outflow"])#cell_i24_data["outflow"]#
 
 
-    def updateVehicles(self):
+    def update_vehicles(self):
         # Outgoing ghost cells
         vehicle_actors = self.world.get_actors(self.cars)
         cars_and_lanes = {}
@@ -178,7 +178,7 @@ class I24MotionCarlaSimulation:
                 cell_metadata = self.road_cells[road]["inflow_ghost_cell"][lane_id]
                 if (cell_metadata["cumulative_inflow_real"] > cell_metadata["cumulative_inflow_sim"]):
                     delta = cell_metadata["cumulative_inflow_real"] - cell_metadata["cumulative_inflow_sim"]
-                    cell_metadata["cumulative_inflow_sim"] += self.generateVehiclesInCell(cell_metadata, delta)
+                    cell_metadata["cumulative_inflow_sim"] += self.generate_vehicles_in_cell(cell_metadata, delta)
                     print(f"Spawned {delta} vehicles in {road}:{lane_id}!")
         
         vehicle_actors = self.world.get_actors(self.cars)
@@ -191,7 +191,7 @@ class I24MotionCarlaSimulation:
                 self.tm.vehicle_percentage_speed_difference(vehicle, ((self.vehicle_speed / self.default_speed_limit) + 1) * -100.0)
                 #self.tm.set_desired_speed(vehicle, self.vehicle_speed)
 
-    def fetchData(self):
+    def fetch_data(self):
         vehicle_actors = self.world.get_actors(self.cars)
         vehicle_ids = []
         road_ids = []
@@ -239,34 +239,34 @@ class I24MotionCarlaSimulation:
         #print(f"Recording {len(concat_df)} records!")
         self.trajectory_data = pandas.concat([self.trajectory_data, concat_df])
 
-    def calculateDensityTime(self, sim_time):
+    def calculate_density_time(self, sim_time):
         time_index = int(sim_time // self.density_time_step)
         density_time = (time_index * self.density_time_step) + self.time_origin
         density_time_string = str(round(density_time, 0))
         return density_time_string
     
-    def calculateCurrentDensityTime(self):
-        return self.calculateDensityTime(self.current_time)
+    def calculate_current_density_time(self):
+        return self.calculate_density_time(self.current_time)
     
-    def getDensityInformation(self, sim_time, density_marker, density_road_id, lane_id):
-        return self.density_data["data"][str(density_road_id)][str(lane_id)][str(density_marker)][self.calculateDensityTime(sim_time)]
+    def get_density_information(self, sim_time, density_marker, density_road_id, lane_id):
+        return self.density_data["data"][str(density_road_id)][str(lane_id)][str(density_marker)][self.calculate_density_time(sim_time)]
     
-    def getCurrentDensityInformation(self, density_marker, density_road_id, lane_id):
-        return self.getDensityInformation(self.current_time, density_marker, density_road_id, lane_id)
+    def get_current_density_information(self, density_marker, density_road_id, lane_id):
+        return self.get_density_information(self.current_time, density_marker, density_road_id, lane_id)
         
     @staticmethod
-    def westboundMarkerToS(marker, origin_marker, origin_meter):
+    def westbound_marker_to_s(marker, origin_marker, origin_meter):
         return (((origin_marker - marker) * I24MotionCarlaSimulation.mile_to_feet) * I24MotionCarlaSimulation.feet_to_meters) + origin_meter
     
     @staticmethod
-    def eastboundMarkerToS(marker, origin_marker, origin_meter):
+    def eastbound_marker_to_s(marker, origin_marker, origin_meter):
         return (((marker - origin_marker) * I24MotionCarlaSimulation.mile_to_feet) * I24MotionCarlaSimulation.feet_to_meters) + origin_meter
     
     @staticmethod
-    def convertMileDeltaToMeters(delta):
+    def convert_mile_delta_to_meters(delta):
         return (delta * I24MotionCarlaSimulation.mile_to_feet) * I24MotionCarlaSimulation.feet_to_meters
     
-    def createCellDefinition(self, road_id, road_entry_mapping, waypoints, marker_region):
+    def create_cell_definition(self, road_id, road_entry_mapping, waypoints, marker_region):
         result = {}
         for lane in range(1, road_entry_mapping["lanes"] + 1):
             lane_data = {}
@@ -278,12 +278,12 @@ class I24MotionCarlaSimulation:
 
             if road_entry_mapping["direction"] == "eastbound":
                 lane_data["density_marker"] = str(round(back_marker, 2))
-                s_start = I24MotionCarlaSimulation.eastboundMarkerToS(back_marker, road_entry_mapping["origin_marker"], road_entry_mapping["origin_meter"])
-                s_end = I24MotionCarlaSimulation.eastboundMarkerToS(front_marker, road_entry_mapping["origin_marker"], road_entry_mapping["origin_meter"])            
+                s_start = I24MotionCarlaSimulation.eastbound_marker_to_s(back_marker, road_entry_mapping["origin_marker"], road_entry_mapping["origin_meter"])
+                s_end = I24MotionCarlaSimulation.eastbound_marker_to_s(front_marker, road_entry_mapping["origin_marker"], road_entry_mapping["origin_meter"])            
             elif road_entry_mapping["direction"] == "westbound":
                 lane_data["density_marker"] = str(round(front_marker, 2))
-                s_start = I24MotionCarlaSimulation.westboundMarkerToS(back_marker, road_entry_mapping["origin_marker"], road_entry_mapping["origin_meter"])
-                s_end = I24MotionCarlaSimulation.westboundMarkerToS(front_marker, road_entry_mapping["origin_marker"], road_entry_mapping["origin_meter"])
+                s_start = I24MotionCarlaSimulation.westbound_marker_to_s(back_marker, road_entry_mapping["origin_marker"], road_entry_mapping["origin_meter"])
+                s_end = I24MotionCarlaSimulation.westbound_marker_to_s(front_marker, road_entry_mapping["origin_marker"], road_entry_mapping["origin_meter"])
             lane_data["s_start"] = s_start
             lane_data["s_end"] = s_end
             lane_data["length"] = s_end - s_start
@@ -297,24 +297,24 @@ class I24MotionCarlaSimulation:
             result[lane_id] = lane_data       
         return result
     
-    def generateRoadCellMetadata(self):
+    def generate_road_cell_metadata(self):
         all_waypoints = self.carla_map.generate_waypoints(self.waypoint_distance)
         metadata = {}
         for road in self.mapping:
             metadata_entry = {}
             road_id = int(road)
             metadata_entry["direction"] = self.mapping[road]["direction"]
-            metadata_entry["inflow_ghost_cell"] = self.createCellDefinition(road_id, self.mapping[road], all_waypoints, self.mapping[road]["inflow_ghost_region"])
-            metadata_entry["outflow_ghost_cell"] = self.createCellDefinition(road_id, self.mapping[road], all_waypoints, self.mapping[road]["outflow_ghost_region"])
+            metadata_entry["inflow_ghost_cell"] = self.create_cell_definition(road_id, self.mapping[road], all_waypoints, self.mapping[road]["inflow_ghost_region"])
+            metadata_entry["outflow_ghost_cell"] = self.create_cell_definition(road_id, self.mapping[road], all_waypoints, self.mapping[road]["outflow_ghost_region"])
             metadata_entry["normal_cells"] = {}
             for m in numpy.arange(self.mapping[road]["normal_region"][0], self.mapping[road]["normal_region"][1], self.mapping[road]["longitudinal_occupancy_cell_delta_miles"]):
                 m = round(m, 2)
                 m_final = round(m + self.mapping[road]["longitudinal_occupancy_cell_delta_miles"], 2)
-                metadata_entry["normal_cells"][m] = self.createCellDefinition(road_id, self.mapping[road], all_waypoints, [m, m_final])
+                metadata_entry["normal_cells"][m] = self.create_cell_definition(road_id, self.mapping[road], all_waypoints, [m, m_final])
             metadata[road_id] =  metadata_entry
         self.road_cells = metadata
 
-    def generateVehiclesInCell(self, cell_info, number_of_vehicles, fail_count=0):
+    def generate_vehicles_in_cell(self, cell_info, number_of_vehicles, fail_count=0):
         fail_attempts_limit = 10
         if (fail_count >= fail_attempts_limit):
             return 0
@@ -366,39 +366,39 @@ class I24MotionCarlaSimulation:
         # If we failed to spawn vehicles, try again
         failed_number_of_spawns = number_of_vehicles - len(all_vehicle_actors)
         if (failed_number_of_spawns > 0):
-            return len(all_vehicle_actors) + self.generateVehiclesInCell(cell_info, failed_number_of_spawns, fail_count=fail_count+1)
+            return len(all_vehicle_actors) + self.generate_vehicles_in_cell(cell_info, failed_number_of_spawns, fail_count=fail_count+1)
         return len(all_vehicle_actors)
     
-    def seedSimulation(self):
-        self.current_density_time = self.calculateCurrentDensityTime()
+    def seed_simulation(self):
+        self.current_density_time = self.calculate_current_density_time()
         # Normal cells
         for road in self.road_cells:
             for m in self.road_cells[road]["normal_cells"]:
                 for lane_id in self.road_cells[road]["normal_cells"][m]:
                     cell_metadata = self.road_cells[road]["normal_cells"][m][lane_id]
-                    cell_i24_data = self.getCurrentDensityInformation(cell_metadata["density_marker"], cell_metadata["density_road_id"], lane_id)
-                    self.generateVehiclesInCell(cell_metadata, self.discreteSampler(cell_i24_data["vehicle_count"]))
+                    cell_i24_data = self.get_current_density_information(cell_metadata["density_marker"], cell_metadata["density_road_id"], lane_id)
+                    self.generate_vehicles_in_cell(cell_metadata, self.discrete_sampler(cell_i24_data["vehicle_count"]))
         
         # Ingoing ghost cells
         for road in self.road_cells:
             for lane_id in self.road_cells[road]["inflow_ghost_cell"]:
                 cell_metadata = self.road_cells[road]["inflow_ghost_cell"][lane_id]
-                cell_i24_data = self.getCurrentDensityInformation(cell_metadata["density_marker"], cell_metadata["density_road_id"], lane_id)
+                cell_i24_data = self.get_current_density_information(cell_metadata["density_marker"], cell_metadata["density_road_id"], lane_id)
                 cell_metadata["cumulative_inflow_real"] = cell_i24_data["inflow"]
                 cell_metadata["cumulative_outflow_real"] = cell_i24_data["outflow"]
                 cell_metadata["cumulative_inflow_sim"] = cell_i24_data["inflow"]
-                self.generateVehiclesInCell(cell_metadata, self.discreteSampler(cell_i24_data["vehicle_count"] - cell_i24_data["outflow"]))
+                self.generate_vehicles_in_cell(cell_metadata, self.discrete_sampler(cell_i24_data["vehicle_count"] - cell_i24_data["outflow"]))
 
         # Outgoing ghost cells
         for road in self.road_cells:
             for lane_id in self.road_cells[road]["outflow_ghost_cell"]:
                 cell_metadata = self.road_cells[road]["outflow_ghost_cell"][lane_id]
-                cell_i24_data = self.getCurrentDensityInformation(cell_metadata["density_marker"], cell_metadata["density_road_id"], lane_id)
+                cell_i24_data = self.get_current_density_information(cell_metadata["density_marker"], cell_metadata["density_road_id"], lane_id)
                 cell_metadata["cumulative_inflow_real"] = cell_i24_data["inflow"]
                 cell_metadata["cumulative_outflow_real"] = cell_i24_data["outflow"]
                 cell_metadata["cumulative_outflow_sim"] = cell_i24_data["outflow"]
-                self.generateVehiclesInCell(cell_metadata, self.discreteSampler(cell_i24_data["vehicle_count"] - cell_i24_data["outflow"]))
+                self.generate_vehicles_in_cell(cell_metadata, self.discrete_sampler(cell_i24_data["vehicle_count"] - cell_i24_data["outflow"]))
 
 if __name__ == "__main__":
     sim = I24MotionCarlaSimulation("localhost", 2000, "final_density_data_1s_delta.json", "i24_motion_to_carla_mapping_adjusted_origin.json", "result5.csv", "metadata_output.json")
-    sim.launchSimulation()
+    sim.launch_simulation()

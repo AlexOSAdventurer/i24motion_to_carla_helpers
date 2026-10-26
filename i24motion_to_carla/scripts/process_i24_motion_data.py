@@ -27,27 +27,27 @@ road_lane_data = {
 }
 
 # We assume all the lanes are on the right of the reference line
-def tConversionFunction(y_position):
+def t_conversion_function(y_position):
     return ((abs(y_position) - 12.0) * feet_to_meters) * -1
 
-def convertXPositionToMarker(x_position):
+def convert_x_position_to_marker(x_position):
     return x_position / mile_to_feet
 
-def westboundMarkerToS(marker):
+def westbound_marker_to_s(marker):
     return (((mapping_data["2"]["origin_marker"] - marker) * mile_to_feet) * feet_to_meters) + mapping_data["2"]["origin_meter"]
 
-def eastboundMarkerToS(marker):
+def eastbound_marker_to_s(marker):
     return (((marker - mapping_data["1"]["origin_marker"]) * mile_to_feet) * feet_to_meters) + mapping_data["1"]["origin_meter"]
 
-def convertYPositionToRoadAndLaneAndT(y_position):
-    t_position = tConversionFunction(y_position)
+def convert_y_position_to_road_and_lane_and_t(y_position):
+    t_position = t_conversion_function(y_position)
     for road in road_lane_data:
         for lane in road_lane_data[road]:
             bounds = road_lane_data[road][lane]
             if (y_position > bounds[0]) and (y_position < bounds[1]):
                 return t_position, road, lane
 
-def processDataIntoDicts(source_data, roads, lanes, unique_id_count=1):
+def process_data_into_dicts(source_data, roads, lanes, unique_id_count=1):
     road_lane_trajectory_data = {}
     for road in roads:
         road_lane_trajectory_data[road] = {}
@@ -76,18 +76,18 @@ def processDataIntoDicts(source_data, roads, lanes, unique_id_count=1):
             new_obj_height = entry["height"]
             new_obj_class = entry["coarse_vehicle_class"]
 
-            marker = convertXPositionToMarker(new_obj_x)
-            res = convertYPositionToRoadAndLaneAndT(new_obj_y)
+            marker = convert_x_position_to_marker(new_obj_x)
+            res = convert_y_position_to_road_and_lane_and_t(new_obj_y)
             if (res == None):
                 continue
             new_obj_t, new_obj_road, new_obj_lane = res
             new_obj_s = None
             #Eastbound
             if new_obj_road == 1:
-                new_obj_s = eastboundMarkerToS(marker)
+                new_obj_s = eastbound_marker_to_s(marker)
             # Westbound
             elif new_obj_road == 2:
-                new_obj_s = westboundMarkerToS(marker)
+                new_obj_s = westbound_marker_to_s(marker)
 
             new_obj_id = unique_id_count
             road_lane_trajectory_data[new_obj_road][new_obj_lane]["time"].append(new_obj_time)
@@ -103,7 +103,7 @@ def processDataIntoDicts(source_data, roads, lanes, unique_id_count=1):
         unique_id_count += 1
     return road_lane_trajectory_data
 
-road_lane_trajectory_data = processDataIntoDicts(full_data, roads, lanes)
+road_lane_trajectory_data = process_data_into_dicts(full_data, roads, lanes)
 
 def generator_function(road_and_lane_data):
     print(len(road_and_lane_data["id"]))

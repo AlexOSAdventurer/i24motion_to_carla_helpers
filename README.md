@@ -12,19 +12,13 @@ Run:
 
         git clone https://<your-access-token>@github.com/AlexOSAdventurer/i24motion_to_carla_helpers.git
 
-It comes with the CARLA branch and Unreal Engine source linked as submodules.
-
-Then do:
+CARLA and Unreal Engine are not submodules. Download them with the included scripts:
 
         cd i24motion_to_carla_helpers
-        git submodule init
-        git submodule update
-
-To download the CARLA branch.
-
-To download Unreal, do this after:
-
+        ./download_carla.sh
         ./download_Unreal.sh <YOUR OAUTH GITHUB TOKEN>
+
+`download_carla.sh` clones the `0.9.16_TrafficWaves` CARLA branch into `carla-0.9.16/`, and `download_Unreal.sh` clones the CARLA fork of Unreal Engine 4.26 into `UnrealEngine_4.26/`.
 
 
 ## Installation and Use
@@ -57,7 +51,7 @@ To download and import the map, run:
         ./I24_CARLA_download.sh
         ./I24_CARLA_import.sh
 
-The map is now in the Unreal Engine's "/Game/Carla/Maps/FinalMapFinal" path, like the other canonical maps.
+The downloaded archive is named `FinalMapFinal.tar.gz`, but the map inside it is called "FinalMapI24Mini". It is now in the Unreal Engine's "/Game/Carla/Maps/FinalMapI24Mini" path, like the other canonical maps.
 
 #### Process the I-24 Motion data into a parquet dataset
 The I-24 motion data is post-processed into a parquet dataset to enable real-time lookup of trajectories with respect to time and space bounding boxes (as in, a bounding box on a time-space traffic diagram), even when the dataset is large. The cost is that it can take several minutes of initial preprocessing before you can use it - the reward is that you only run it once, then never again. 
@@ -70,7 +64,7 @@ Run in the CARLA docker container:
 This will result in a "road_data" folder being created inside of the scripts folder, with each parquet database corresponding to a unique road-lane pairing.
 
 #### Run simulation
-In one shell within the container, launch CARLA with `make launch`, open the "/Game/Carla/Maps/FinalMapFinal/FinalMapFinal.umap" map, and launch the simulation to expose the server.
+In one shell within the container, launch CARLA with `make launch`, open the "/Game/Carla/Maps/FinalMapI24Mini/FinalMapI24Mini.umap" map, and launch the simulation to expose the server.
 Then, in the other shell, do:
 
         cd /workspaces/i24motion_to_carla/scripts

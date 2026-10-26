@@ -19,10 +19,10 @@ class I24MotionData:
         self.s_min = s_min
         self.s_max = s_max
         self.conn = duckdb.connect()
-        self.preloadAllData()
-        self.preloadSubset()
+        self.preload_all_data()
+        self.preload_subset()
 
-    def preloadAllData(self):
+    def preload_all_data(self):
         for lane in self.road_lane_lookup[self.road_id]:
             lane_str = str(lane) if lane >= 0 else "neg"+str(abs(lane))
             ref = f"{self.trajectories_all_db_prefix}_{self.road_id}_{lane_str}"
@@ -32,14 +32,14 @@ class I24MotionData:
                 SELECT * FROM parquet_scan('{file_path}')             
             """)
 
-    def preloadSubset(self):
+    def preload_subset(self):
         for lane in self.road_lane_lookup[self.road_id]:
             lane_str = str(lane) if lane >= 0 else "neg"+str(abs(lane))
             source_ref = f"{self.trajectories_all_db_prefix}_{self.road_id}_{lane_str}"
             dest_ref = f"{self.trajectories_subset_db_prefix}_{self.road_id}_{lane_str}"
-            self.directQueryEdieBoxDB(source_ref, dest_ref, self.timestamp_min, self.timestamp_max, self.s_min, self.s_max)
+            self.direct_query_edie_box_db(source_ref, dest_ref, self.timestamp_min, self.timestamp_max, self.s_min, self.s_max)
 
-    def directQueryEdieBoxDF(self, source_ref, timestamp_min, timestamp_max, s_min, s_max):
+    def direct_query_edie_box_df(self, source_ref, timestamp_min, timestamp_max, s_min, s_max):
         q = f"""
         SELECT time, x, y, length, width, height, class, id, s, t
         FROM {source_ref}
@@ -48,7 +48,7 @@ class I24MotionData:
         """
         return self.conn.execute(q, [timestamp_min, timestamp_max, s_min, s_max]).fetch_df()
     
-    def directQueryEdieBoxDB(self, source_ref, dest_ref, timestamp_min, timestamp_max, s_min, s_max):
+    def direct_query_edie_box_db(self, source_ref, dest_ref, timestamp_min, timestamp_max, s_min, s_max):
         q = f"""
         CREATE TABLE {dest_ref} AS
         SELECT time, x, y, length, width, height, class, id, s, t
@@ -58,7 +58,7 @@ class I24MotionData:
         """
         return self.conn.execute(q, [timestamp_min, timestamp_max, s_min, s_max])
     
-    def getVehicleTrajectoryDF(self, source_ref, id):
+    def get_vehicle_trajectory_df(self, source_ref, id):
         q = f"""
         SELECT time, x, y, length, width, height, class, id, s, t
         FROM {source_ref}
@@ -67,17 +67,17 @@ class I24MotionData:
         """
         return self.conn.execute(q, [id]).fetch_df()
     
-    def getVehicleTrajectory(self, lane, id):
+    def get_vehicle_trajectory(self, lane, id):
         lane_str = str(lane) if lane >= 0 else "neg"+str(abs(lane))
         source_ref = f"{self.trajectories_subset_db_prefix}_{self.road_id}_{lane_str}"
-        return self.getVehicleTrajectoryDF(source_ref, id)
+        return self.get_vehicle_trajectory_df(source_ref, id)
     
-    def queryEdieBoxSubset(self, timestamp_min, timestamp_max, s_min, s_max, ignore_ids = None):
+    def query_edie_box_subset(self, timestamp_min, timestamp_max, s_min, s_max, ignore_ids = None):
         result = {}
         for lane in self.road_lane_lookup[self.road_id]:
             lane_str = str(lane) if lane >= 0 else "neg"+str(abs(lane))
             source_ref = f"{self.trajectories_subset_db_prefix}_{self.road_id}_{lane_str}"
-            result[lane] = self.directQueryEdieBoxDF(source_ref, timestamp_min, timestamp_max, s_min, s_max)
+            result[lane] = self.direct_query_edie_box_df(source_ref, timestamp_min, timestamp_max, s_min, s_max)
             # Each unique id needs at least two rows corresponding to it so we can estimate velocity and justifiably say it's a reliable track
             unique_ids = list(result[lane]["id"].unique())
             for id in unique_ids:
